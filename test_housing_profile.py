@@ -1,0 +1,359 @@
+import json
+import os
+import tempfile
+import unittest
+
+import housing_profile as hp
+
+COUNTY = "0500000US08041"
+STATE = "0400000US08"
+PLACE = "1600000US0816000"
+
+# Real line layout of co2024a.txt (Census BPS annual county file).
+BPS_2024 = [
+    "Survey,FIPS,FIPS,Region,Division,County,,1-unit,,,2-units,,,3-4 units,,,5+ units,,,"
+    "1-unit rep,,,2-units rep,,,3-4 units rep,,,5+ units rep,,,\n",
+    "Date,State,County,Code,Code,Name,Bldgs,Units,Value,Bldgs,Units,Value,Bldgs,Units,Value,"
+    "Bldgs,Units,Value,Bldgs,Units,Value,Bldgs,Units,Value,Bldgs,Units,Value,Bldgs,Units,Value\n",
+    " \n",
+    "2024,01,001,3,6,Autauga County                ,221,221,82537210,0,0,0,0,0,0,0,0,0,"
+    "221,221,82537210,0,0,0,0,0,0,0,0,0\n",
+    "2024,08,041,4,8,El Paso County                ,2733,2733,1565916233,119,238,56713798,"
+    "2,6,2509808,22,872,183362655,2733,2733,1565916233,119,238,56713798,2,6,2509808,22,872,183362655\n",
+]
+BPS_2025 = [
+    "2025,08,041,4,8,El Paso County                ,2500,2500,1500000000,100,200,50000000,"
+    "5,15,3000000,30,1151,200000000,2500,2500,1500000000,100,200,50000000,5,15,3000000,30,1151,200000000\n",
+    "2025,08,043,4,8,Fremont County                ,100,100,30000000,0,0,0,0,0,0,1,10,1000000,"
+    "100,100,30000000,0,0,0,0,0,0,1,10,1000000\n",
+]
+
+# Real line layout of we2025a.txt (Census BPS annual place file, West region): 17 identifying
+# fields, then 24 permit columns. The identifying fields are copied from the live file; some
+# permit numbers are made up.
+DENVER_2025 = ("2025,08,173000,031,0320,20000 ,00000 ,735538 ,216,19740,2,1,80202      ,4,8,11,Denver,"
+               "1027,1027,332552732,10,20,5000000,4,14,3000000,60,3500,600000000,"
+               "1027,1027,332552732,10,20,5000000,4,14,3000000,60,3500,600000000\n")
+PLACE_2025 = [
+    "Survey,State,6-Digit,County,Census Place,FIPS Place,FIPS MCD,Pop,CSA,CBSA,Footnote,Central,Zip,"
+    "Region,Division,Number of,Place,1-unit,,,2-units,,,3-4 units,,,5+ units,,,"
+    "1-unit rep,,,2-units rep,,,3-4 units rep,,,5+ units rep,,,\n",
+    "Date,Code,ID,Code,Code,Code,Code,  ,Code,Code,Code,City,Code,Code,Code,Months Rep,Name,"
+    "Bldgs,Units,Value,Bldgs,Units,Value,Bldgs,Units,Value,Bldgs,Units,Value,"
+    "Bldgs,Units,Value,Bldgs,Units,Value,Bldgs,Units,Value,Bldgs,Units,Value\n",
+    " \n",
+    DENVER_2025,
+    "2025,08,201000,041,    ,99990 ,00000 ,196856 ,999,17820,2, ,80910      ,4,8,12,"
+    "El Paso County Unincorporated Area,2719,2719,900000000,0,0,0,0,0,0,0,0,0,"
+    "2719,2719,900000000,0,0,0,0,0,0,0,0,0\n",
+    "2025,08,231000,065,    ,00000 ,00000 ,7310 ,999,99999, , ,80461      ,4,8,12,Lake County,"
+    "10,10,4000000,0,0,0,0,0,0,0,0,0,10,10,4000000,0,0,0,0,0,0,0,0,0\n",
+    "2025,08,683000,125,1395,86750 ,00000 ,3497 ,999,99999, , ,80759      ,4,8,12,Yuma,"
+    "0,0,0,1,2,124000,0,0,0,0,0,0,0,0,0,1,2,124000,0,0,0,0,0,0\n",
+    "2025,49,067000,035,2335,67000 ,00000 ,181743 ,482,41620,2,1,84111      ,4,8,12,Salt Lake City,"
+    "200,200,80000000,0,0,0,0,0,0,10,900,150000000,200,200,80000000,0,0,0,0,0,0,10,900,150000000\n",
+]
+
+
+def row(table, estimates, moes=None):
+    out = {}
+    for line, value in estimates.items():
+        out[hp.acs_column(table, line)] = float(value)
+    for line, value in (moes or {}).items():
+        out[hp.acs_column(table, line, moe=True)] = float(value)
+    return out
+
+
+def county_acs():
+    tables = {
+        "b01003": row("b01003", {1: 750000}, {1: 0}),
+        "b25001": row("b25001", {1: 300000}, {1: 500}),
+        "b25002": row("b25002", {1: 300000, 2: 285000, 3: 15000}, {1: 500, 2: 1500, 3: 1200}),
+        "b25003": row("b25003", {1: 285000, 2: 180000, 3: 105000}, {1: 1500, 2: 2000, 3: 2100}),
+        "b25004": row("b25004", {1: 15000, 2: 4000, 3: 1000, 4: 1500, 5: 500, 6: 3000}, {6: 400}),
+        "b19013": row("b19013", {1: 90000}, {1: 900}),
+        "b25119": row("b25119", {1: 90000, 2: 110000, 3: 60000}, {1: 900, 2: 1200, 3: 1500}),
+        "b25064": row("b25064", {1: 1755}, {1: 46}),
+        "b25077": row("b25077", {1: 450000}, {1: 4000}),
+        "b25070": row("b25070", {1: 105000, 2: 10000, 3: 15000, 4: 15000, 5: 10000, 6: 10000,
+                                 7: 8000, 8: 6000, 9: 7000, 10: 20000, 11: 4000},
+                      {n: 300 for n in range(1, 12)}),
+        "b25091": row("b25091", {**{n: 10000 for n in (3, 4, 5, 6, 7, 14, 15, 16, 17, 18)},
+                                 1: 180000, 2: 120000, 12: 500, 13: 60000, 23: 1000,
+                                 8: 5000, 9: 3000, 10: 3000, 11: 6000,
+                                 19: 1000, 20: 500, 21: 500, 22: 1000},
+                      {n: 200 for n in range(1, 24)}),
+        "b25024": row("b25024", {1: 300000, 2: 200000, 3: 20000, 4: 10000, 5: 15000, 6: 10000,
+                                 7: 10000, 8: 10000, 9: 15000, 10: 9000, 11: 1000},
+                      {n: 400 for n in range(1, 12)}),
+        "b25034": row("b25034", {1: 300000, 2: 15000, 3: 45000, 4: 50000, 5: 40000, 6: 75000,
+                                 7: 30000, 8: 20000, 9: 15000, 10: 5000, 11: 5000},
+                      {n: 400 for n in range(1, 12)}),
+    }
+    return {t: {COUNTY: r} for t, r in tables.items()}
+
+
+def permits():
+    return {2024: hp.read_bps_county(BPS_2024), 2025: hp.read_bps_county(BPS_2025)}
+
+
+def permits_with_places():
+    by_year = permits()
+    by_year[2025].update(hp.read_bps_place(PLACE_2025))
+    return by_year
+
+
+class ParseTests(unittest.TestCase):
+    def test_parse_value(self):
+        self.assertEqual(hp.parse_value("1755"), 1755.0)
+        self.assertEqual(hp.parse_value(" 12.5 "), 12.5)
+        self.assertIsNone(hp.parse_value(""))
+        self.assertIsNone(hp.parse_value("null"))
+        self.assertIsNone(hp.parse_value("-666666666"))
+        self.assertIsNone(hp.parse_value("-999999999", is_moe=True))
+        self.assertEqual(hp.parse_value("-555555555", is_moe=True), 0.0)
+        self.assertIsNone(hp.parse_value("-555555555"))
+        self.assertEqual(hp.parse_value("-5"), -5.0)
+
+    def test_read_acs_table_filters(self):
+        lines = [
+            "﻿GEO_ID|B25064_E001|B25064_M001\n",
+            "0100000US|1487|3\n",
+            "0400000US08|1690|9\n",
+            "0500000US08041|1755|46\n",
+            "0500000US49035|1600|20\n",
+            "1600000US0816000|1700|-555555555\n",
+            "1400000US08041000100|1500|100\n",
+        ]
+        got = hp.read_acs_table(lines, ("0400000US08", "0500000US08", "1600000US08"))
+        self.assertEqual(sorted(got), ["0400000US08", COUNTY, PLACE])
+        self.assertEqual(got[COUNTY], {"B25064_E001": 1755.0, "B25064_M001": 46.0})
+        self.assertEqual(got[PLACE]["B25064_M001"], 0.0)
+        only = hp.read_acs_table(lines, ("0500000US",), wanted={COUNTY}, columns={"B25064_E001"})
+        self.assertEqual(only, {COUNTY: {"B25064_E001": 1755.0}})
+        self.assertEqual(hp.read_acs_table([], ("0500000US",)), {})
+
+    def test_read_geos(self):
+        header = ("FILEID|STUSAB|SUMLEVEL|COMPONENT|US|REGION|DIVISION|STATE|COUNTY|COUSUB|PLACE|"
+                  "TRACT|BLKGRP|CONCIT|AIANHH|AIANHHFP|AIHHTLI|AITS|AITSFP|ANRC|CBSA|CSA|METDIV|"
+                  "MACC|MEMI|NECTA|CNECTA|NECTADIV|UA|CDCURR|SLDU|SLDL|ZCTA5|SUBMCD|SDELM|SDSEC|"
+                  "SDUNI|UR|PCI|PUMA5|GEO_ID|NAME|BTTR|BTBG|TL_GEO_ID\n")
+        pad = "|" * 40
+        lines = [header,
+                 "ACSSF|CO|050" + pad[3:] + "|0500000US08041|El Paso County, Colorado|||08041\n",
+                 "ACSSF|US|010" + pad[3:] + "|0100000US|United States|||\n"]
+        # FILEID..PUMA5 are 40 columns, so GEO_ID is index 40 and NAME index 41.
+        names = hp.read_geos(lines, ("0500000US",))
+        self.assertEqual(names, {COUNTY: "El Paso County, Colorado"})
+
+    def test_read_bps_county(self):
+        got = hp.read_bps_county(BPS_2024)
+        self.assertEqual(sorted(got), ["01001", "08041"])
+        ep = got["08041"]
+        self.assertEqual(ep["year"], 2024)
+        self.assertEqual(ep["name"], "El Paso County")
+        self.assertEqual((ep["units_1"], ep["units_2"], ep["units_3_4"], ep["units_5plus"]),
+                         (2733, 238, 6, 872))
+        self.assertEqual(ep["units_total"], 3849)
+        self.assertEqual(ep["bldgs_5plus"], 22)
+        self.assertEqual(ep["value"], 1565916233 + 56713798 + 2509808 + 183362655)
+        self.assertEqual(sorted(hp.read_bps_county(BPS_2024, {"08"})), ["08041"])
+
+    def test_read_bps_place(self):
+        got = hp.read_bps_place(PLACE_2025)
+        # Unincorporated (99990) and county-wide (00000) offices are skipped.
+        self.assertEqual(sorted(got), ["0820000", "0886750", "4967000"])
+        den = got["0820000"]
+        self.assertEqual((den["year"], den["name"]), (2025, "Denver"))
+        self.assertEqual((den["units_1"], den["units_2"], den["units_3_4"], den["units_5plus"]),
+                         (1027, 20, 14, 3500))
+        self.assertEqual(den["units_total"], 4561)
+        self.assertEqual(den["bldgs_5plus"], 60)
+        self.assertEqual(den["value"], 332552732 + 5000000 + 3000000 + 600000000)
+        self.assertEqual(got["0886750"]["units_total"], 2)
+        self.assertEqual(sorted(hp.read_bps_place(PLACE_2025, {"08"})), ["0820000", "0886750"])
+
+    def test_read_bps_place_adds_duplicates(self):
+        got = hp.read_bps_place([DENVER_2025, DENVER_2025])
+        self.assertEqual(got["0820000"]["units_total"], 9122)
+        self.assertEqual(got["0820000"]["units_5plus"], 7000)
+
+    def test_place_permit_url(self):
+        self.assertEqual(hp.place_permit_url("West", 2025),
+                         "https://www2.census.gov/econ/bps/Place/West%20Region/we2025a.txt")
+        self.assertEqual(hp.place_permit_url("Midwest", 2016),
+                         "https://www2.census.gov/econ/bps/Place/Midwest%20Region/mw2016a.txt")
+        self.assertEqual(len(hp.STATE_REGION), 51)
+        self.assertEqual(hp.STATE_REGION["08"], "West")
+        self.assertEqual(hp.STATE_REGION["11"], "South")
+        self.assertEqual(set(hp.STATE_REGION) | {"72"}, set(hp.STATES))
+
+
+class MathTests(unittest.TestCase):
+    def test_moe_sum(self):
+        self.assertAlmostEqual(hp.moe_sum([3, 4]), 5.0)
+        self.assertIsNone(hp.moe_sum([3, None]))
+        self.assertIsNone(hp.moe_sum([]))
+
+    def test_moe_proportion(self):
+        self.assertAlmostEqual(hp.moe_proportion(50, 100, 10, 20), 0.0)
+        self.assertAlmostEqual(hp.moe_proportion(25, 100, 10, 20), 75 ** 0.5 / 100)
+        # Negative radicand falls back to the ratio formula.
+        self.assertAlmostEqual(hp.moe_proportion(80, 100, 5, 20), 281 ** 0.5 / 100)
+        self.assertIsNone(hp.moe_proportion(1, 0, 1, 1))
+        self.assertIsNone(hp.moe_proportion(1, 2, None, 1))
+
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = hp.build_profile(COUNTY, "El Paso County, Colorado", county_acs(), permits(), 2024)
+        self.m = {k: v["value"] for k, v in self.profile["metrics"].items()}
+
+    def test_identity(self):
+        p = self.profile
+        self.assertEqual((p["fips"], p["level"]), ("08041", "county"))
+        self.assertEqual(p["acs"], "2020-2024 ACS 5-year estimates")
+        self.assertEqual(list(p["metrics"]), hp.METRIC_KEYS)
+
+    def test_occupancy_and_vacancy(self):
+        self.assertEqual(self.m["population"], 750000)
+        self.assertAlmostEqual(self.m["vacancy_rate"], 0.05)
+        self.assertAlmostEqual(self.m["renter_share"], 0.3684, places=4)
+        self.assertAlmostEqual(self.m["rental_vacancy_rate"], 4000 / 110000, places=4)
+        self.assertAlmostEqual(self.m["homeowner_vacancy_rate"], 1500 / 182000, places=4)
+        self.assertAlmostEqual(self.m["seasonal_share_of_units"], 0.01)
+
+    def test_structure(self):
+        self.assertAlmostEqual(self.m["single_family_share"], 0.7333, places=4)
+        self.assertAlmostEqual(self.m["two_to_four_share"], 0.0833, places=4)
+        self.assertAlmostEqual(self.m["five_plus_share"], 0.15)
+        self.assertAlmostEqual(self.m["mobile_home_share"], 0.03)
+        self.assertAlmostEqual(self.m["built_2010_or_later_share"], 0.2)
+        self.assertAlmostEqual(self.m["built_before_1980_share"], 0.25)
+
+    def test_affordability(self):
+        self.assertEqual(self.m["median_gross_rent"], 1755)
+        self.assertEqual(self.m["income_needed_for_median_rent"], 70200)
+        self.assertEqual(self.profile["metrics"]["income_needed_for_median_rent"]["moe"], 1840)
+        self.assertAlmostEqual(self.m["renter_income_to_needed_ratio"], 0.85)
+        self.assertAlmostEqual(self.m["value_to_income_ratio"], 5.0)
+        self.assertEqual(self.m["rent_burdened_households"], 41000)
+        self.assertAlmostEqual(self.m["rent_burdened_share"], 41000 / 101000, places=4)
+        self.assertAlmostEqual(self.m["severely_rent_burdened_share"], 20000 / 101000, places=4)
+        self.assertAlmostEqual(self.m["owner_burdened_share"], 20000 / 178500, places=4)
+        self.assertAlmostEqual(self.m["severely_owner_burdened_share"], 7000 / 178500, places=4)
+
+    def test_share_moe_present(self):
+        moe = self.profile["metrics"]["rent_burdened_share"]["moe"]
+        self.assertIsNotNone(moe)
+        self.assertGreater(moe, 0)
+        self.assertLess(moe, 0.05)
+
+    def test_permits(self):
+        p = self.profile["permits"]
+        self.assertEqual(p["years"], [2024, 2025])
+        self.assertEqual([r["units_total"] for r in p["by_year"]], [3849, 3866])
+        self.assertEqual(p["by_year"][1]["units_2_4"], 215)
+        self.assertEqual(p["total_units"], 7715)
+        self.assertAlmostEqual(p["avg_annual_units"], 3857.5)
+        self.assertAlmostEqual(p["multifamily_share"], 2482 / 7715, places=4)
+        self.assertAlmostEqual(p["avg_annual_per_1000_units"], 12.86, places=2)
+
+    def test_state_permits_sum_counties(self):
+        series = hp.permit_series(permits(), "08")
+        self.assertEqual([r["units_total"] for r in series], [3849, 3866 + 110])
+        self.assertEqual(hp.permit_series(permits(), "0816000"), [])
+
+    def test_state_permits_ignore_places(self):
+        series = hp.permit_series(permits_with_places(), "08")
+        self.assertEqual([r["units_total"] for r in series], [3849, 3866 + 110])
+
+    def test_place_permits(self):
+        self.assertEqual([r["units_total"] for r in hp.permit_series(permits_with_places(), "0820000")],
+                         [4561])
+        p = hp.build_profile("1600000US0820000", "Denver city, Colorado", {}, permits_with_places(), 2024)
+        self.assertEqual(p["level"], "place")
+        self.assertEqual(p["permits"]["years"], [2025])
+        self.assertEqual(p["permits"]["total_units"], 4561)
+        self.assertAlmostEqual(p["permits"]["multifamily_share"], 3534 / 4561, places=4)
+        self.assertIsNone(p["permits"]["avg_annual_per_1000_units"])
+        md = hp.render_markdown(p, {"permit_span": "2024-2025"})
+        self.assertIn("| 2025 | 4,561 | 1,027 | 34 | 3,500 |", md)
+
+    def test_missing_data_is_none(self):
+        p = hp.build_profile(PLACE, "Colorado Springs city, Colorado", {}, permits(), 2024)
+        self.assertEqual(p["level"], "place")
+        self.assertTrue(all(v["value"] is None for v in p["metrics"].values()))
+        self.assertIsNone(p["permits"])
+        md = hp.render_markdown(p, {"permit_span": "2024-2025"})
+        self.assertIn("n/a", md)
+        self.assertIn("No Building Permits Survey record for this geography", md)
+
+
+class OutputTests(unittest.TestCase):
+    def test_fmt_and_slug(self):
+        self.assertEqual(hp.fmt(1234567.4, "count"), "1,234,567")
+        self.assertEqual(hp.fmt(1755, "usd"), "$1,755")
+        self.assertEqual(hp.fmt(0.4059, "share"), "40.6%")
+        self.assertEqual(hp.fmt(5, "ratio"), "5.00")
+        self.assertEqual(hp.fmt(None, "usd"), "n/a")
+        self.assertEqual(hp.slugify("Doña Ana County, New Mexico"), "dona-ana-county")
+        self.assertEqual(hp.slugify("Colorado Springs city, Colorado"), "colorado-springs-city")
+
+    def test_resolve_states_and_years(self):
+        self.assertEqual(hp.resolve_states("CO, 49,co"), ["08", "49"])
+        self.assertEqual(len(hp.resolve_states("all")), 52)
+        self.assertEqual(hp.resolve_states(""), [])
+        with self.assertRaises(ValueError):
+            hp.resolve_states("ZZ")
+        self.assertEqual(hp.parse_years("2016-2018,2020"), [2016, 2017, 2018, 2020])
+
+    def test_markdown(self):
+        p = hp.build_profile(COUNTY, "El Paso County, Colorado", county_acs(), permits(), 2024)
+        md = hp.render_markdown(p, {"permit_span": "2024-2025"})
+        self.assertIn("# Housing profile: El Paso County, Colorado", md)
+        self.assertIn("| Median gross rent (monthly) | $1,755 | +/- $46 | B25064_E001 |", md)
+        self.assertIn("| 2024 | 3,849 | 2,733 | 244 | 872 |", md)
+        self.assertIn("MV2 of Munim, Inc.", md)
+        self.assertIn("not endorsed or certified by the Census Bureau", md)
+
+    def test_csv_row_matches_header(self):
+        p = hp.build_profile(COUNTY, "El Paso County, Colorado", county_acs(), permits(), 2024)
+        self.assertEqual(len(hp.csv_row(p)), len(hp.csv_header()))
+        empty = hp.build_profile(PLACE, "X city, Colorado", {}, {}, 2024)
+        self.assertEqual(len(hp.csv_row(empty)), len(hp.csv_header()))
+
+    def test_write_outputs(self):
+        acs = county_acs()
+        for table, rows in list(acs.items()):
+            rows[STATE] = dict(rows[COUNTY])
+        profiles = [
+            hp.build_profile(STATE, "Colorado", acs, permits(), 2024),
+            hp.build_profile(COUNTY, "El Paso County, Colorado", acs, permits(), 2024),
+            hp.build_profile(PLACE, "Colorado Springs city, Colorado", {}, permits(), 2024),
+            hp.build_profile("1600000US0820000", "Denver city, Colorado", {}, permits_with_places(), 2024),
+        ]
+        meta = {"permit_span": "2024-2025", "generated_at": "2026-10-13T00:00Z", "places_min_pop": 1000}
+        with tempfile.TemporaryDirectory() as tmp:
+            hp.write_outputs(profiles, tmp, ["08"], meta)
+            for rel in ["states.csv", "counties.csv", "manifest.json", "CO/README.md", "CO/counties.csv",
+                        "CO/places.csv", "CO/08-colorado.md", "CO/counties/08041-el-paso-county.json",
+                        "CO/counties/08041-el-paso-county.md",
+                        "CO/places/0816000-colorado-springs-city.md",
+                        "CO/places/0820000-denver-city.json"]:
+                self.assertTrue(os.path.exists(os.path.join(tmp, rel)), rel)
+            with open(os.path.join(tmp, "CO", "counties", "08041-el-paso-county.json"), encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertEqual(data["metrics"]["median_gross_rent"]["value"], 1755)
+            with open(os.path.join(tmp, "CO", "README.md"), encoding="utf-8") as fh:
+                index = fh.read()
+            self.assertIn("[El Paso County](counties/08041-el-paso-county.md)", index)
+            self.assertIn("Places with 1,000+ residents (2)", index)
+            self.assertIn("| [Denver city](places/0820000-denver-city.md) | n/a | n/a | n/a | n/a | n/a | 4,561 |",
+                          index)
+            with open(os.path.join(tmp, "counties.csv"), encoding="utf-8") as fh:
+                self.assertEqual(len(fh.read().strip().splitlines()), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

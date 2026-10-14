@@ -1,0 +1,34 @@
+# Monthly report build. To turn it on, copy this file to .github/workflows/refresh.yml.
+# It runs the tests, rebuilds reports/ from the Census Bureau files and commits any change.
+name: refresh
+on:
+  schedule:
+    - cron: "23 10 4 * *"
+  push:
+    branches: [main]
+    paths:
+      - housing_profile.py
+      - .github/workflows/refresh.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest -v
+      - run: python housing_profile.py --states all --detail-states CO --out reports --cache .cache
+      - name: Commit changed reports
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports
+          if ! git diff --cached --quiet; then
+            git commit -m "reports: refresh from Census Bureau files"
+            git push
+          fi
