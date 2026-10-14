@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """housing_profile.py - housing data profiles for U.S. states, counties and places,
-built only from public Census Bureau files. No API key, no third-party packages.
+built only from public Census Bureau and HUD files. No API key, no third-party packages.
 
 Sources:
   * American Community Survey (ACS) 5-year table-based summary files
@@ -9,12 +9,15 @@ Sources:
     https://www2.census.gov/econ/bps/County/co<year>a.txt
   * Building Permits Survey (BPS) annual place files, one per Census region
     https://www2.census.gov/econ/bps/Place/<Region> Region/<ne|mw|so|we><year>a.txt
+  * HUD Comprehensive Housing Affordability Strategy (CHAS) data, Table 8
+    https://www.huduser.gov/portal/datasets/cp.html
 
 Every metric carries its source table and formula, and ACS margins of error are kept
 (and propagated for derived shares, using the Census Bureau's approximation formulas).
 
 By MV2 of Munim, Inc. Made with AI agents. MIT license.
 This product uses Census Bureau data but is not endorsed or certified by the Census Bureau.
+It also uses HUD CHAS data and is not endorsed by HUD.
 """
 
 import argparse
@@ -30,8 +33,9 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+import zipfile
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 REPO_URL = "https://github.com/munimv2/housing-data-profiles"
 USER_AGENT = "housing-data-profiles/%s (MV2 of Munim, Inc.; %s)" % (__version__, REPO_URL)
@@ -41,9 +45,12 @@ ACS_TABLE_URL = ACS_BASE + "data/5YRData/acsdt5y{year}-{table}.dat"
 ACS_GEOS_URL = ACS_BASE + "documentation/Geos{year}5YR.txt"
 BPS_COUNTY_URL = "https://www2.census.gov/econ/bps/County/co{year}a.txt"
 BPS_PLACE_URL = "https://www2.census.gov/econ/bps/Place/{region}%20Region/{prefix}{year}a.txt"
+CHAS_URL = "https://www.huduser.gov/portal/datasets/cp/{period}-{level}-csv.zip"
 
 DEFAULT_ACS_YEAR = 2024
 DEFAULT_PERMIT_YEARS = "2016-2025"
+DEFAULT_CHAS_PERIOD = "2018thru2022"
+DEFAULT_CHAS_LEVELS = "040,050,160"   # states, counties, places
 
 # ACS table -> the line numbers this tool reads from it.
 NEEDED_LINES = {
@@ -114,6 +121,29 @@ SECTIONS = [
 METRIC_KEYS = [key for _, keys in SECTIONS for key in keys]
 
 PERMIT_FIELDS = ["units_1", "units_2", "units_3_4", "units_5plus", "bldgs_5plus", "value"]
+
+# HUD CHAS Table 8 is tenure by household income (as a share of HUD Area Median Family Income,
+# HAMFI) by housing cost burden by complete kitchen and plumbing facilities. Owners start at
+# column 2 and renters at column 68; each income band takes 13 columns. Inside a band that
+# starts at column s, columns s+4 and s+7 are the households with a cost burden over 30% to 50%
+# and over 50% (s+1 and s+10 are 30% or less and not computed).
+# (key, label, owner band start, renter band start)
+CHAS_BANDS = [
+    ("le30", "0-30% of HAMFI (extremely low income)", 3, 69),
+    ("30_50", "30-50% of HAMFI (very low income)", 16, 82),
+    ("50_80", "50-80% of HAMFI (low income)", 29, 95),
+    ("80_100", "80-100% of HAMFI", 42, 108),
+    ("gt100", "Over 100% of HAMFI", 55, 121),
+]
+CHAS_CB_30_50, CHAS_CB_50 = 4, 7
+# (key, label, band keys) in display order.
+CHAS_GROUPS = [(key, label, [key]) for key, label, _, _ in CHAS_BANDS] + [
+    ("le80", "All households at or under 80% of HAMFI", ["le30", "30_50", "50_80"]),
+    ("all", "All households", [key for key, _, _, _ in CHAS_BANDS]),
+]
+CHAS_CSV_GROUPS = ["le30", "30_50", "50_80", "le80", "all"]
+CHAS_CSV_FIELDS = ["households", "renter_households", "cost_burdened", "cost_burdened_share",
+                   "severely_cost_burdened", "severely_cost_burdened_share"]
 
 
 # ---------------------------------------------------------------- parsing
@@ -267,6 +297,59 @@ def read_bps_place(lines, states=None):
     return out
 
 
+def chas_fips(geoid):
+    """CHAS geoid ('05000US08123', '16000US0820000') -> FIPS code ('08123', '0820000')."""
+    geoid = (geoid or "").strip()
+    if "US" in geoid:
+        return geoid.split("US", 1)[1]
+    return geoid if geoid.isdigit() else ""
+
+
+def read_chas_table8(lines, wanted=None):
+    """Parse a CHAS Table8.csv (comma-delimited, header row first, columns source, sumlevel,
+    geoid, name, ... then T8_est<n> and T8_moe<n>) -> {FIPS: {"est": {n: value}, "moe": {n: value}}},
+    keeping only FIPS codes in `wanted`, if given. Column names are matched in any case."""
+    reader = csv.reader(lines)
+    try:
+        header = [h.strip().lstrip("﻿").lower() for h in next(reader)]
+    except StopIteration:
+        return {}
+    if "geoid" not in header:
+        raise ValueError("CHAS Table 8 file has no geoid column")
+    i_geo = header.index("geoid")
+    cols = []
+    for i, name in enumerate(header):
+        match = re.match(r"t8_(est|moe)(\d+)$", name)
+        if match:
+            cols.append((i, match.group(1), int(match.group(2))))
+    out = {}
+    for parts in reader:
+        if len(parts) <= i_geo:
+            continue
+        fips = chas_fips(parts[i_geo])
+        if not fips or (wanted is not None and fips not in wanted):
+            continue
+        row = {"est": {}, "moe": {}}
+        for i, kind, n in cols:
+            row[kind][n] = parse_value(parts[i] if i < len(parts) else "")
+        out[fips] = row
+    return out
+
+
+def chas_table8_lines(zip_path):
+    """The lines of Table8.csv inside a CHAS download zip (any folder inside the zip)."""
+    with zipfile.ZipFile(zip_path) as zf:
+        names = [n for n in zf.namelist() if n.replace("\\", "/").rsplit("/", 1)[-1].lower() == "table8.csv"]
+        if not names:
+            raise ValueError("no Table8.csv in %s" % zip_path)
+        data = zf.read(names[0])
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    return text.splitlines()
+
+
 # ---------------------------------------------------------------- arithmetic
 
 def _sum(values):
@@ -369,6 +452,58 @@ def summarize_permits(series, housing_units):
     }
 
 
+def chas_period_label(period):
+    return (period or "").replace("thru", "-")
+
+
+def chas_group(row, band_keys):
+    """Households, renters and cost-burdened counts and shares for some CHAS income bands.
+    As in HUD's own CHAS summaries, the shares' denominator is all households in the bands,
+    including those whose cost burden could not be computed."""
+    starts = {key: (owner, renter) for key, _, owner, renter in CHAS_BANDS}
+    owner_starts = [starts[k][0] for k in band_keys]
+    renter_starts = [starts[k][1] for k in band_keys]
+    all_starts = owner_starts + renter_starts
+
+    def total(cols):
+        return (_sum(row["est"].get(c) for c in cols), moe_sum(row["moe"].get(c) for c in cols))
+
+    households, households_moe = total(all_starts)
+    renters, renters_moe = total(renter_starts)
+    burdened, burdened_moe = total([s + off for s in all_starts for off in (CHAS_CB_30_50, CHAS_CB_50)])
+    severe, severe_moe = total([s + CHAS_CB_50 for s in all_starts])
+    renter_burdened, _ = total([s + off for s in renter_starts for off in (CHAS_CB_30_50, CHAS_CB_50)])
+    return {
+        "households": _clean(households, "count"),
+        "households_moe": _clean(households_moe, "count"),
+        "renter_households": _clean(renters, "count"),
+        "renter_households_moe": _clean(renters_moe, "count"),
+        "cost_burdened": _clean(burdened, "count"),
+        "cost_burdened_moe": _clean(burdened_moe, "count"),
+        "cost_burdened_share": _clean(_ratio(burdened, households), "share"),
+        "cost_burdened_share_moe": _clean(
+            moe_proportion(burdened, households, burdened_moe, households_moe), "share"),
+        "severely_cost_burdened": _clean(severe, "count"),
+        "severely_cost_burdened_moe": _clean(severe_moe, "count"),
+        "severely_cost_burdened_share": _clean(_ratio(severe, households), "share"),
+        "severely_cost_burdened_share_moe": _clean(
+            moe_proportion(severe, households, severe_moe, households_moe), "share"),
+        "renter_cost_burdened": _clean(renter_burdened, "count"),
+    }
+
+
+def chas_summary(row, period=DEFAULT_CHAS_PERIOD):
+    """One geography's CHAS Table 8 row -> cost burden by income band, or None."""
+    if not row:
+        return None
+    groups = []
+    for key, label, band_keys in CHAS_GROUPS:
+        group = {"key": key, "label": label}
+        group.update(chas_group(row, band_keys))
+        groups.append(group)
+    return {"source": "HUD CHAS %s, Table 8" % chas_period_label(period), "groups": groups}
+
+
 def _clean(value, unit):
     if value is None:
         return None
@@ -379,8 +514,10 @@ def _clean(value, unit):
     return round(value, 2)
 
 
-def build_profile(geo_id, name, acs, permits_by_year=None, acs_year=DEFAULT_ACS_YEAR):
-    """One geography's housing profile as a plain dict (JSON-ready)."""
+def build_profile(geo_id, name, acs, permits_by_year=None, acs_year=DEFAULT_ACS_YEAR, chas=None,
+                  chas_period=DEFAULT_CHAS_PERIOD):
+    """One geography's housing profile as a plain dict (JSON-ready). `chas` maps FIPS codes to
+    CHAS Table 8 rows (see read_chas_table8)."""
 
     def e(table, line):
         row = acs.get(table, {}).get(geo_id)
@@ -488,6 +625,7 @@ def build_profile(geo_id, name, acs, permits_by_year=None, acs_year=DEFAULT_ACS_
         "acs": "%d-%d ACS 5-year estimates" % (acs_year - 4, acs_year),
         "metrics": {key: metrics[key] for key in METRIC_KEYS},
         "permits": permits,
+        "chas": chas_summary((chas or {}).get(fips), chas_period),
     }
 
 
@@ -514,6 +652,27 @@ def file_stem(profile):
     return "%s-%s" % (profile["fips"], slugify(profile["name"]))
 
 
+def render_chas(chas):
+    lines = ["## Cost burden by household income (HUD CHAS)", ""]
+    if not chas:
+        return lines + ["No HUD CHAS record for this geography.", ""]
+    lines += [
+        "From %s. Income bands are shares of HUD Area Median Family Income (HAMFI). Cost-burdened "
+        "means housing costs over 30%% of income; severely, over 50%%." % chas["source"],
+        "",
+        "| Household income | Households | Renter households | Cost-burdened | Share | "
+        "Severely cost-burdened | Share |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for g in chas["groups"]:
+        label = g["label"] if g["key"] not in ("le80", "all") else "**%s**" % g["label"]
+        lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
+            label, fmt(g["households"], "count"), fmt(g["renter_households"], "count"),
+            fmt(g["cost_burdened"], "count"), fmt(g["cost_burdened_share"], "share"),
+            fmt(g["severely_cost_burdened"], "count"), fmt(g["severely_cost_burdened_share"], "share")))
+    return lines + [""]
+
+
 def render_markdown(profile, meta=None):
     meta = meta or {}
     lines = ["# Housing profile: %s" % profile["name"], ""]
@@ -531,6 +690,7 @@ def render_markdown(profile, meta=None):
             lines.append("| %s | %s | %s | %s |" % (mt["label"], fmt(mt["value"], mt["unit"]), moe,
                                                      mt["source"]))
         lines.append("")
+    lines += render_chas(profile.get("chas"))
     permits = profile.get("permits")
     lines += ["## New housing authorized by building permits", ""]
     if permits:
@@ -556,15 +716,19 @@ def render_markdown(profile, meta=None):
         "Share margins are in percentage points.",
         "- \"Cost-burdened\" means paying 30% or more of household income on housing; \"severely\" means "
         "50% or more. Households whose cost ratio cannot be computed are left out of the denominator.",
+        "- The HUD CHAS figures are a special tabulation of an earlier ACS period, rounded by HUD, and use "
+        "HUD's definitions: over 30% and over 50% of income, with households whose cost burden is not "
+        "computed kept in the denominator, as in HUD's own summaries. They will not match the ACS "
+        "shares above exactly.",
         "- Building permit counts are Census Bureau estimates (reported plus imputed) for permit-issuing "
         "offices only; housing built where no permit is required is not counted. A state's figure is the "
         "sum of its counties. A place's figure is its own permit office's, keyed by FIPS place code.",
         "- This profile is a starting point for a housing needs assessment, not a complete one, and is not "
-        "legal or compliance advice.",
+        "legal, compliance or investment advice.",
         "",
         "Generated by [housing-data-profiles](%s) %s, by MV2 of Munim, Inc. (made with AI agents). "
-        "This product uses Census Bureau data but is not endorsed or certified by the Census Bureau." % (
-            REPO_URL, __version__),
+        "This product uses Census Bureau data but is not endorsed or certified by the Census Bureau. "
+        "HUD CHAS data are from HUD User; this product is not endorsed by HUD." % (REPO_URL, __version__),
         "",
     ]
     return "\n".join(lines)
@@ -576,6 +740,7 @@ def csv_header():
         cols += [key, key + "_moe"]
     cols += ["permit_years", "permits_total_units", "permits_avg_annual_units",
              "permits_multifamily_share", "permits_avg_annual_per_1000_units"]
+    cols += ["chas_%s_%s" % (g, field) for g in CHAS_CSV_GROUPS for field in CHAS_CSV_FIELDS]
     return cols
 
 
@@ -592,6 +757,11 @@ def csv_row(profile):
                 "" if p["avg_annual_per_1000_units"] is None else p["avg_annual_per_1000_units"]]
     else:
         row += ["", "", "", "", ""]
+    chas = profile.get("chas")
+    groups = {g["key"]: g for g in chas["groups"]} if chas else {}
+    for key in CHAS_CSV_GROUPS:
+        g = groups.get(key, {})
+        row += ["" if g.get(field) is None else g[field] for field in CHAS_CSV_FIELDS]
     return row
 
 
@@ -714,6 +884,10 @@ def place_permit_url(region, year):
     return BPS_PLACE_URL.format(region=region, prefix=BPS_REGION_PREFIX[region], year=year)
 
 
+def chas_url(period, level):
+    return CHAS_URL.format(period=period, level=level)
+
+
 def resolve_states(spec):
     """'all' -> every state, DC and Puerto Rico; 'CO,49' -> ['08', '49']; '' -> []."""
     spec = (spec or "").strip()
@@ -750,6 +924,31 @@ def parse_years(spec):
         else:
             years.add(int(part))
     return sorted(years)
+
+
+def load_chas(period, levels, wanted_fips, cache, log=print):
+    """Read CHAS Table 8 for the given summary levels -> ({FIPS: row}, [source URLs]).
+    A level that cannot be downloaded or read is skipped with a log line; a cached file that is
+    not a zip (for example an error page) is deleted so the next run tries again."""
+    chas, sources = {}, []
+    for level in levels:
+        url = chas_url(period, level)
+        try:
+            path = fetch(url, cache, log)
+        except (urllib.error.URLError, OSError) as exc:
+            log("skip HUD CHAS %s: %s" % (level, exc))
+            continue
+        try:
+            rows = read_chas_table8(chas_table8_lines(path), wanted_fips)
+        except (zipfile.BadZipFile, ValueError, csv.Error) as exc:
+            log("skip HUD CHAS %s: %s" % (level, exc))
+            if isinstance(exc, zipfile.BadZipFile):
+                os.remove(path)
+            continue
+        log("read HUD CHAS %s: %d geographies" % (level, len(rows)))
+        chas.update(rows)
+        sources.append(url)
+    return chas, sources
 
 
 def run(args, log=print):
@@ -804,7 +1003,15 @@ def run(args, log=print):
             permits_by_year[py].update(read_bps_place(iter_text_lines(path), set(detail)))
             sources.append(url)
 
-    profiles = [build_profile(g, names.get(g, g), acs, permits_by_year, year)
+    chas, chas_period = {}, (args.chas_period or "").strip()
+    if chas_period:
+        levels = [lv.strip() for lv in (args.chas_levels or "").split(",") if lv.strip()]
+        if not detail:
+            levels = [lv for lv in levels if lv != "160"]
+        chas, chas_sources = load_chas(chas_period, levels, {fips_of(g) for g in wanted}, args.cache, log)
+        sources += chas_sources
+
+    profiles = [build_profile(g, names.get(g, g), acs, permits_by_year, year, chas, chas_period)
                 for g in sorted(wanted, key=lambda g: (LEVEL_ORDER.get(level_of(g), 9), g))]
     meta = {
         "tool": "housing-data-profiles",
@@ -813,6 +1020,8 @@ def run(args, log=print):
         "acs": "%d-%d ACS 5-year estimates (table-based summary file)" % (year - 4, year),
         "permit_years": loaded,
         "permit_span": "%d-%d" % (loaded[0], loaded[-1]) if loaded else "",
+        "chas": "HUD CHAS %s, Table 8" % chas_period_label(chas_period) if chas else "",
+        "chas_profiles": sum(1 for p in profiles if p["chas"]),
         "states": [STATES[s] for s in states],
         "detail_states": [STATES[s] for s in detail],
         "places_min_pop": args.places_min_pop,
@@ -826,8 +1035,8 @@ def run(args, log=print):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Housing data profiles from public Census Bureau files "
-                                             "(ACS 5-year + Building Permits Survey). No API key needed.")
+    ap = argparse.ArgumentParser(description="Housing data profiles from public Census Bureau and HUD files "
+                                             "(ACS 5-year, Building Permits Survey, HUD CHAS). No API key needed.")
     ap.add_argument("--states", default="all",
                     help="states for the CSV summaries: 'all' or a list like CO,UT or 08,49 (default all)")
     ap.add_argument("--detail-states", default="",
@@ -838,6 +1047,11 @@ def main(argv=None):
                     help="last year of the ACS 5-year period (default %d)" % DEFAULT_ACS_YEAR)
     ap.add_argument("--permit-years", default=DEFAULT_PERMIT_YEARS,
                     help="building permit years, e.g. 2016-2025 (default %s)" % DEFAULT_PERMIT_YEARS)
+    ap.add_argument("--chas-period", default=DEFAULT_CHAS_PERIOD,
+                    help="HUD CHAS period, e.g. 2018thru2022 (default); an empty value skips CHAS")
+    ap.add_argument("--chas-levels", default=DEFAULT_CHAS_LEVELS,
+                    help="CHAS summary levels to read (default %s: states, counties, places)"
+                         % DEFAULT_CHAS_LEVELS)
     ap.add_argument("--out", default="reports", help="output folder (default reports)")
     ap.add_argument("--cache", default=".cache", help="download cache folder (default .cache)")
     ap.add_argument("--version", action="version", version=__version__)

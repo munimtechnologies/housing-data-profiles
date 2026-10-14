@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 
 import housing_profile as hp
 
@@ -54,6 +55,38 @@ PLACE_2025 = [
     "200,200,80000000,0,0,0,0,0,0,10,900,150000000,200,200,80000000,0,0,0,0,0,0,10,900,150000000\n",
 ]
 
+# HUD CHAS Table 8 for Weld County, CO. The band totals and the over-50% cells (T8_est3, 16, 29,
+# 69, 82, 95, 23, 36, 89, 102) are HUD's published values from its CHAS county layer; the
+# over-30%-to-50% cells are split so that the sums equal HUD's published derived fields
+# (T8_LE30_CB 6,745, T8_LE30_CB50 5,665, T8_LE80_CB 20,990, T8_LE80_CB50 11,110, T8_LE30_CB_R 4,025).
+WELD_EST = {
+    1: 99815, 2: 71450, 68: 28365,
+    3: 3625, 7: 820, 10: 1900, 69: 5580, 73: 260, 76: 3765,
+    16: 4980, 20: 1310, 23: 1800, 82: 5085, 86: 2155, 89: 1715,
+    29: 8895, 33: 2775, 36: 1335, 95: 6740, 99: 2560, 102: 595,
+}
+WELD_MOE = {3: 100, 69: 200, 7: 30, 10: 40}
+
+
+def chas_lines(rows, sumlevel="050"):
+    """A CHAS Table8.csv in HUD's layout: source, sumlevel, geoid, name, st, cnty, then
+    T8_est1..T8_est133 and T8_moe1..T8_moe133."""
+    header = ["source", "sumlevel", "geoid", "name", "st", "cnty"]
+    header += ["T8_est%d" % n for n in range(1, 134)] + ["T8_moe%d" % n for n in range(1, 134)]
+    out = [",".join(header) + "\n"]
+    for geoid, name, est, moe in rows:
+        cells = ["2018thru2022", sumlevel, geoid, '"%s"' % name, geoid[7:9], geoid[9:12]]
+        cells += [str(est.get(n, 0)) for n in range(1, 134)]
+        cells += [str(moe.get(n, 0)) for n in range(1, 134)]
+        out.append(",".join(cells) + "\n")
+    return out
+
+
+WELD_LINES = chas_lines([
+    ("05000US08123", "Weld County, Colorado", WELD_EST, WELD_MOE),
+    ("05000US35013", "Doña Ana County, New Mexico", {3: 10}, {}),
+])
+
 
 def row(table, estimates, moes=None):
     out = {}
@@ -101,6 +134,10 @@ def permits_with_places():
     by_year = permits()
     by_year[2025].update(hp.read_bps_place(PLACE_2025))
     return by_year
+
+
+def weld_chas():
+    return hp.read_chas_table8(WELD_LINES)
 
 
 class ParseTests(unittest.TestCase):
@@ -189,6 +226,63 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(set(hp.STATE_REGION) | {"72"}, set(hp.STATES))
 
 
+class ChasParseTests(unittest.TestCase):
+    def test_chas_fips_and_url(self):
+        self.assertEqual(hp.chas_fips("05000US08123"), "08123")
+        self.assertEqual(hp.chas_fips("04000US08"), "08")
+        self.assertEqual(hp.chas_fips("16000US0820000"), "0820000")
+        self.assertEqual(hp.chas_fips("08123"), "08123")
+        self.assertEqual(hp.chas_fips("Weld"), "")
+        self.assertEqual(hp.chas_url("2018thru2022", "050"),
+                         "https://www.huduser.gov/portal/datasets/cp/2018thru2022-050-csv.zip")
+        self.assertEqual(hp.chas_period_label("2018thru2022"), "2018-2022")
+
+    def test_read_chas_table8(self):
+        got = weld_chas()
+        self.assertEqual(sorted(got), ["08123", "35013"])
+        weld = got["08123"]
+        self.assertEqual(weld["est"][3], 3625.0)
+        self.assertEqual(weld["est"][133], 0.0)
+        self.assertEqual(weld["moe"][69], 200.0)
+        self.assertEqual(len(weld["est"]), 133)
+        only = hp.read_chas_table8(WELD_LINES, {"08123"})
+        self.assertEqual(sorted(only), ["08123"])
+        self.assertEqual(hp.read_chas_table8([]), {})
+
+    def test_read_chas_table8_any_case_and_blanks(self):
+        lines = ["﻿SOURCE,SUMLEVEL,GEOID,NAME,T8_EST1,T8_MOE1,T8_EST2\n",
+                 '2018thru2022,040,04000US08,"Colorado",2300000,5000,\n']
+        got = hp.read_chas_table8(lines)
+        self.assertEqual(got["08"]["est"], {1: 2300000.0, 2: None})
+        self.assertEqual(got["08"]["moe"], {1: 5000.0})
+        with self.assertRaises(ValueError):
+            hp.read_chas_table8(["source,name,T8_est1\n"])
+
+    def test_chas_zip_and_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = os.path.join(tmp, "2018thru2022-050-csv.zip")
+            with zipfile.ZipFile(good, "w") as zf:
+                zf.writestr("050/Table1.csv", "source,geoid\n")
+                # A Latin-1 file (Doña Ana), so the UTF-8 decode falls back.
+                zf.writestr("050/Table8.csv", "".join(WELD_LINES).encode("latin-1"))
+            got = hp.read_chas_table8(hp.chas_table8_lines(good))
+            self.assertEqual(sorted(got), ["08123", "35013"])
+            bad = os.path.join(tmp, "2018thru2022-040-csv.zip")
+            with open(bad, "w") as fh:
+                fh.write("<html>blocked</html>")
+            logged = []
+            chas, sources = hp.load_chas("2018thru2022", ["040", "050"], {"08123"}, tmp, logged.append)
+            self.assertEqual(sorted(chas), ["08123"])
+            self.assertEqual(sources, ["https://www.huduser.gov/portal/datasets/cp/2018thru2022-050-csv.zip"])
+            self.assertFalse(os.path.exists(bad))
+            self.assertTrue(any(msg.startswith("skip HUD CHAS 040") for msg in logged))
+            empty = os.path.join(tmp, "empty.zip")
+            with zipfile.ZipFile(empty, "w") as zf:
+                zf.writestr("050/Table9.csv", "x\n")
+            with self.assertRaises(ValueError):
+                hp.chas_table8_lines(empty)
+
+
 class MathTests(unittest.TestCase):
     def test_moe_sum(self):
         self.assertAlmostEqual(hp.moe_sum([3, 4]), 5.0)
@@ -204,6 +298,53 @@ class MathTests(unittest.TestCase):
         self.assertIsNone(hp.moe_proportion(1, 2, None, 1))
 
 
+class ChasSummaryTests(unittest.TestCase):
+    def setUp(self):
+        summary = hp.chas_summary(weld_chas()["08123"])
+        self.summary = summary
+        self.g = {g["key"]: g for g in summary["groups"]}
+
+    def test_groups(self):
+        self.assertEqual(self.summary["source"], "HUD CHAS 2018-2022, Table 8")
+        self.assertEqual([g["key"] for g in self.summary["groups"]],
+                         ["le30", "30_50", "50_80", "80_100", "gt100", "le80", "all"])
+
+    def test_matches_hud_published_fields(self):
+        le30 = self.g["le30"]
+        self.assertEqual(le30["households"], 9205)               # T8_LE30
+        self.assertEqual(le30["cost_burdened"], 6745)            # T8_LE30_CB
+        self.assertEqual(le30["severely_cost_burdened"], 5665)   # T8_LE30_CB50
+        self.assertEqual(le30["renter_cost_burdened"], 4025)     # T8_LE30_CB_R
+        self.assertEqual(le30["renter_households"], 5580)
+        self.assertAlmostEqual(le30["cost_burdened_share"], 0.7328)          # T8_LE30_CB_PCT 73.28
+        self.assertAlmostEqual(le30["severely_cost_burdened_share"], 0.6154)  # T8_LE30_CB50_PCT 61.54
+        self.assertEqual(self.g["30_50"]["cost_burdened"], 6980)             # T8_GT30_LE50_CB
+        self.assertEqual(self.g["30_50"]["severely_cost_burdened"], 3515)    # T8_GT30_LE50_CB50
+        self.assertEqual(self.g["50_80"]["cost_burdened"], 7265)             # T8_GT50_LE80_CB
+        self.assertEqual(self.g["50_80"]["severely_cost_burdened"], 1930)    # T8_GT50_LE80_CB50
+        le80 = self.g["le80"]
+        self.assertEqual(le80["cost_burdened"], 20990)                       # T8_LE80_CB
+        self.assertEqual(le80["severely_cost_burdened"], 11110)              # T8_LE80_CB50
+        self.assertEqual(le80["households"], 34905)
+        self.assertEqual(le80["renter_households"], 17405)
+
+    def test_moe_and_empty_bands(self):
+        le30 = self.g["le30"]
+        self.assertEqual(le30["households_moe"], 224)       # sqrt(100^2 + 200^2)
+        self.assertEqual(le30["cost_burdened_moe"], 50)     # sqrt(30^2 + 40^2)
+        self.assertIsNotNone(le30["cost_burdened_share_moe"])
+        self.assertLess(le30["cost_burdened_share_moe"], 0.05)
+        self.assertEqual(self.g["80_100"]["households"], 0)
+        self.assertIsNone(self.g["80_100"]["cost_burdened_share"])
+        self.assertIsNone(hp.chas_summary(None))
+
+    def test_missing_cells_give_none(self):
+        summary = hp.chas_summary({"est": {3: 10.0}, "moe": {}})
+        le30 = {g["key"]: g for g in summary["groups"]}["le30"]
+        self.assertIsNone(le30["households"])
+        self.assertIsNone(le30["households_moe"])
+
+
 class ProfileTests(unittest.TestCase):
     def setUp(self):
         self.profile = hp.build_profile(COUNTY, "El Paso County, Colorado", county_acs(), permits(), 2024)
@@ -214,6 +355,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual((p["fips"], p["level"]), ("08041", "county"))
         self.assertEqual(p["acs"], "2020-2024 ACS 5-year estimates")
         self.assertEqual(list(p["metrics"]), hp.METRIC_KEYS)
+        self.assertIsNone(p["chas"])
 
     def test_occupancy_and_vacancy(self):
         self.assertEqual(self.m["population"], 750000)
@@ -288,6 +430,18 @@ class ProfileTests(unittest.TestCase):
         md = hp.render_markdown(p, {"permit_span": "2024-2025"})
         self.assertIn("n/a", md)
         self.assertIn("No Building Permits Survey record for this geography", md)
+        self.assertIn("No HUD CHAS record for this geography.", md)
+
+    def test_chas_in_profile(self):
+        p = hp.build_profile("0500000US08123", "Weld County, Colorado", {}, {}, 2024, weld_chas())
+        self.assertEqual(p["chas"]["source"], "HUD CHAS 2018-2022, Table 8")
+        md = hp.render_markdown(p)
+        self.assertIn("## Cost burden by household income (HUD CHAS)", md)
+        self.assertIn("| 0-30% of HAMFI (extremely low income) | 9,205 | 5,580 | 6,745 | 73.3% | 5,665 | 61.5% |",
+                      md)
+        self.assertIn("| **All households at or under 80% of HAMFI** | 34,905 | 17,405 | 20,990 | 60.1% | "
+                      "11,110 | 31.8% |", md)
+        self.assertIn("not endorsed by HUD", md)
 
 
 class OutputTests(unittest.TestCase):
@@ -322,6 +476,17 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(len(hp.csv_row(p)), len(hp.csv_header()))
         empty = hp.build_profile(PLACE, "X city, Colorado", {}, {}, 2024)
         self.assertEqual(len(hp.csv_row(empty)), len(hp.csv_header()))
+
+    def test_csv_chas_columns(self):
+        p = hp.build_profile("0500000US08123", "Weld County, Colorado", {}, {}, 2024, weld_chas())
+        header, values = hp.csv_header(), hp.csv_row(p)
+        self.assertEqual(len(values), len(header))
+        got = dict(zip(header, values))
+        self.assertEqual(got["chas_le80_cost_burdened"], 20990)
+        self.assertEqual(got["chas_le80_cost_burdened_share"], 0.6013)
+        self.assertEqual(got["chas_le30_severely_cost_burdened"], 5665)
+        self.assertEqual(len([c for c in header if c.startswith("chas_")]),
+                         len(hp.CHAS_CSV_GROUPS) * len(hp.CHAS_CSV_FIELDS))
 
     def test_write_outputs(self):
         acs = county_acs()
