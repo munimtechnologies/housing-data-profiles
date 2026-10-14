@@ -37,7 +37,7 @@ import zipfile
 
 __version__ = "0.3.1"
 
-REPO_URL = "https://github.com/munimv2/housing-data-profiles"
+REPO_URL = "https://github.com/munimtechnologies/housing-data-profiles"
 USER_AGENT = "housing-data-profiles/%s (MV2 of Munim, Inc.; %s)" % (__version__, REPO_URL)
 
 ACS_BASE = "https://www2.census.gov/programs-surveys/acs/summary_file/{year}/table-based-SF/"
