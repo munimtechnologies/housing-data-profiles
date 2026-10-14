@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 import zipfile
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 REPO_URL = "https://github.com/munimv2/housing-data-profiles"
 USER_AGENT = "housing-data-profiles/%s (MV2 of Munim, Inc.; %s)" % (__version__, REPO_URL)
@@ -46,6 +46,7 @@ ACS_GEOS_URL = ACS_BASE + "documentation/Geos{year}5YR.txt"
 BPS_COUNTY_URL = "https://www2.census.gov/econ/bps/County/co{year}a.txt"
 BPS_PLACE_URL = "https://www2.census.gov/econ/bps/Place/{region}%20Region/{prefix}{year}a.txt"
 CHAS_URL = "https://www.huduser.gov/portal/datasets/cp/{period}-{level}-csv.zip"
+CHAS_PAGE = "https://www.huduser.gov/portal/datasets/cp.html"
 
 DEFAULT_ACS_YEAR = 2024
 DEFAULT_PERMIT_YEARS = "2016-2025"
@@ -69,6 +70,16 @@ NEEDED_LINES = {
     "b25034": list(range(1, 12)),   # year structure built
 }
 ACS_TABLES = list(NEEDED_LINES)
+
+# ACS medians that fall in the open-ended bottom or top interval are published as these "jam"
+# values, with no margin of error: a median home value of 2000001 means "$2,000,000 or more".
+# (bottom, top) per table.
+ACS_JAM_VALUES = {
+    "b19013": (2499, 250001),
+    "b25119": (2499, 250001),
+    "b25064": (99, 3501),
+    "b25077": (9999, 2000001),
+}
 
 SUMLEVEL_PREFIX = {"state": "0400000US", "county": "0500000US", "place": "1600000US"}
 LEVEL_ORDER = {"state": 0, "county": 1, "place": 2}
@@ -119,6 +130,12 @@ SECTIONS = [
     ]),
 ]
 METRIC_KEYS = [key for _, keys in SECTIONS for key in keys]
+# Metrics that are medians, or built from medians, and so can be open-ended bounds.
+BOUND_KEYS = [
+    "median_household_income", "median_owner_income", "median_renter_income", "median_gross_rent",
+    "median_home_value", "income_needed_for_median_rent", "renter_income_to_needed_ratio",
+    "value_to_income_ratio",
+]
 
 PERMIT_FIELDS = ["units_1", "units_2", "units_3_4", "units_5plus", "bldgs_5plus", "value"]
 
@@ -391,6 +408,29 @@ def moe_proportion(num, den, moe_num, moe_den):
     return math.sqrt(radicand) / den
 
 
+def acs_bound(table, value, moe):
+    """An ACS median -> (value, bound). A median published at its table's jam value with no
+    margin of error is in an open-ended interval: it becomes the interval's edge, with bound
+    'at_least' (top) or 'at_most' (bottom). Any other value is returned with bound None."""
+    jam = ACS_JAM_VALUES.get(table)
+    if jam is None or value is None or moe is not None:
+        return value, None
+    if value == jam[1]:
+        return value - 1, "at_least"
+    if value == jam[0]:
+        return value + 1, "at_most"
+    return value, None
+
+
+def ratio_bound(num_bound, den_bound):
+    """The bound of num/den when either is an open-ended median: 'at_least', 'at_most', None
+    (exact) or 'unknown' (the two pull in opposite directions, so the ratio is not known)."""
+    flipped = {"at_least": "at_most", "at_most": "at_least"}.get(den_bound)
+    if num_bound and flipped and num_bound != flipped:
+        return "unknown"
+    return num_bound or flipped
+
+
 # ---------------------------------------------------------------- profiles
 
 def level_of(geo_id):
@@ -527,11 +567,16 @@ def build_profile(geo_id, name, acs, permits_by_year=None, acs_year=DEFAULT_ACS_
         row = acs.get(table, {}).get(geo_id)
         return None if row is None else row.get(acs_column(table, line, moe=True))
 
+    def median(table, line):
+        return acs_bound(table, e(table, line), m(table, line))
+
     metrics = {}
 
-    def add(key, label, value, source, unit, moe=None):
+    def add(key, label, value, source, unit, moe=None, bound=None):
+        if bound == "unknown":
+            value, bound = None, None
         metrics[key] = {"label": label, "value": _clean(value, unit), "moe": _clean(moe, unit),
-                        "unit": unit, "source": source}
+                        "unit": unit, "source": source, "bound": bound}
 
     def share(key, label, num_lines, den_lines, table, source, den_minus=()):
         num = _sum(e(table, n) for n in num_lines)
@@ -578,26 +623,32 @@ def build_profile(geo_id, name, acs, permits_by_year=None, acs_year=DEFAULT_ACS_
     share("built_before_1980_share", "Share of units built before 1980", [7, 8, 9, 10, 11], [1],
           "b25034", "(B25034_E007 .. B25034_E011) / B25034_E001")
 
-    income = e("b19013", 1)
-    renter_income = e("b25119", 3)
-    rent, value = e("b25064", 1), e("b25077", 1)
-    add("median_household_income", "Median household income", income, "B19013_E001", "usd", m("b19013", 1))
-    add("median_owner_income", "Median income, owner households", e("b25119", 2), "B25119_E002",
-        "usd", m("b25119", 2))
+    income, income_bound = median("b19013", 1)
+    owner_income, owner_income_bound = median("b25119", 2)
+    renter_income, renter_income_bound = median("b25119", 3)
+    rent, rent_bound = median("b25064", 1)
+    value, value_bound = median("b25077", 1)
+    add("median_household_income", "Median household income", income, "B19013_E001", "usd",
+        m("b19013", 1), income_bound)
+    add("median_owner_income", "Median income, owner households", owner_income, "B25119_E002",
+        "usd", m("b25119", 2), owner_income_bound)
     add("median_renter_income", "Median income, renter households", renter_income, "B25119_E003",
-        "usd", m("b25119", 3))
-    add("median_gross_rent", "Median gross rent (monthly)", rent, "B25064_E001", "usd", m("b25064", 1))
+        "usd", m("b25119", 3), renter_income_bound)
+    add("median_gross_rent", "Median gross rent (monthly)", rent, "B25064_E001", "usd", m("b25064", 1),
+        rent_bound)
     add("median_home_value", "Median home value (owner-occupied)", value, "B25077_E001", "usd",
-        m("b25077", 1))
+        m("b25077", 1), value_bound)
 
     needed = None if rent is None else rent * 12 / 0.30
     needed_moe = None if m("b25064", 1) is None else m("b25064", 1) * 12 / 0.30
     add("income_needed_for_median_rent", "Income needed to rent at the median without cost burden",
-        needed, "B25064_E001 x 12 / 0.30", "usd", needed_moe)
+        needed, "B25064_E001 x 12 / 0.30", "usd", needed_moe, rent_bound)
     add("renter_income_to_needed_ratio", "Median renter income / income needed for median rent",
-        _ratio(renter_income, needed), "B25119_E003 / (B25064_E001 x 12 / 0.30)", "ratio")
+        _ratio(renter_income, needed), "B25119_E003 / (B25064_E001 x 12 / 0.30)", "ratio",
+        bound=ratio_bound(renter_income_bound, rent_bound))
     add("value_to_income_ratio", "Median home value / median household income",
-        _ratio(value, income), "B25077_E001 / B19013_E001", "ratio")
+        _ratio(value, income), "B25077_E001 / B19013_E001", "ratio",
+        bound=ratio_bound(value_bound, income_bound))
 
     burdened_lines = [7, 8, 9, 10]
     add("rent_burdened_households", "Renter households paying 30%+ of income on rent",
@@ -631,16 +682,27 @@ def build_profile(geo_id, name, acs, permits_by_year=None, acs_year=DEFAULT_ACS_
 
 # ---------------------------------------------------------------- output
 
-def fmt(value, unit):
+def fmt(value, unit, bound=None):
+    """A value for display; an open-ended median reads '$2,000,000+' or 'under $10,000'."""
     if value is None:
         return "n/a"
     if unit == "count":
-        return "{:,}".format(int(round(value)))
-    if unit == "usd":
-        return "${:,}".format(int(round(value)))
-    if unit == "share":
-        return "{:.1f}%".format(value * 100)
-    return "{:.2f}".format(value)
+        text = "{:,}".format(int(round(value)))
+    elif unit == "usd":
+        text = "${:,}".format(int(round(value)))
+    elif unit == "share":
+        text = "{:.1f}%".format(value * 100)
+    else:
+        text = "{:.2f}".format(value)
+    if bound == "at_least":
+        return text + "+"
+    if bound == "at_most":
+        return "under " + text
+    return text
+
+
+def fmt_metric(metric):
+    return fmt(metric["value"], metric["unit"], metric.get("bound"))
 
 
 def slugify(text):
@@ -687,8 +749,7 @@ def render_markdown(profile, meta=None):
         for key in keys:
             mt = metrics[key]
             moe = "+/- " + fmt(mt["moe"], mt["unit"]) if mt["moe"] is not None else ""
-            lines.append("| %s | %s | %s | %s |" % (mt["label"], fmt(mt["value"], mt["unit"]), moe,
-                                                     mt["source"]))
+            lines.append("| %s | %s | %s | %s |" % (mt["label"], fmt_metric(mt), moe, mt["source"]))
         lines.append("")
     lines += render_chas(profile.get("chas"))
     permits = profile.get("permits")
@@ -714,6 +775,12 @@ def render_markdown(profile, meta=None):
         "- ACS figures are 5-year period estimates from a sample survey. Margins of error are at the "
         "90% confidence level; for derived shares they use the Census Bureau's approximation formulas. "
         "Share margins are in percentage points.",
+    ]
+    if any(metrics[key].get("bound") for key in BOUND_KEYS):
+        lines.append("- A value shown with \"+\" or \"under\" is a median in the ACS's open-ended top or "
+                     "bottom interval (for example, a median home value of \"$2,000,000+\"). The Census "
+                     "Bureau publishes only that edge, and ratios built from it are bounds too.")
+    lines += [
         "- \"Cost-burdened\" means paying 30% or more of household income on housing; \"severely\" means "
         "50% or more. Households whose cost ratio cannot be computed are left out of the denominator.",
         "- The HUD CHAS figures are a special tabulation of an earlier ACS period, rounded by HUD, and use "
@@ -738,6 +805,8 @@ def csv_header():
     cols = ["geo_id", "fips", "level", "name"]
     for key in METRIC_KEYS:
         cols += [key, key + "_moe"]
+        if key in BOUND_KEYS:
+            cols.append(key + "_bound")
     cols += ["permit_years", "permits_total_units", "permits_avg_annual_units",
              "permits_multifamily_share", "permits_avg_annual_per_1000_units"]
     cols += ["chas_%s_%s" % (g, field) for g in CHAS_CSV_GROUPS for field in CHAS_CSV_FIELDS]
@@ -749,6 +818,8 @@ def csv_row(profile):
     for key in METRIC_KEYS:
         mt = profile["metrics"][key]
         row += ["" if mt["value"] is None else mt["value"], "" if mt["moe"] is None else mt["moe"]]
+        if key in BOUND_KEYS:
+            row.append(mt.get("bound") or "")
     p = profile.get("permits")
     if p:
         span = "%d-%d" % (p["years"][0], p["years"][-1])
@@ -802,9 +873,9 @@ def render_state_index(state_profile, counties, places, meta):
             mt = p["metrics"]
             cells = [
                 "[%s](%s/%s.md)" % (p["name"].split(",")[0], folder, file_stem(p)),
-                fmt(mt["population"]["value"], "count"), fmt(mt["housing_units"]["value"], "count"),
-                fmt(mt["median_gross_rent"]["value"], "usd"), fmt(mt["median_home_value"]["value"], "usd"),
-                fmt(mt["rent_burdened_share"]["value"], "share"),
+                fmt_metric(mt["population"]), fmt_metric(mt["housing_units"]),
+                fmt_metric(mt["median_gross_rent"]), fmt_metric(mt["median_home_value"]),
+                fmt_metric(mt["rent_burdened_share"]),
                 fmt(p["permits"]["avg_annual_units"], "count") if p.get("permits") else "n/a",
             ]
             out.append("| " + " | ".join(cells) + " |")
@@ -814,6 +885,9 @@ def render_state_index(state_profile, counties, places, meta):
     if places:
         lines += table("Places with %s+ residents" % "{:,}".format(meta.get("places_min_pop", 0)),
                        "places", places)
+        lines += ["Permitted units / yr is n/a for a place with no permit office of its own in the "
+                  "Building Permits Survey (for example, where a county or regional building department "
+                  "issues its permits); its permits are counted in its county's figures.", ""]
     lines += ["Machine-readable: `counties.csv`, `places.csv` and one `.json` per profile. "
               "State abbreviation: %s." % abbr, ""]
     return "\n".join(lines)
@@ -929,7 +1003,8 @@ def parse_years(spec):
 def load_chas(period, levels, wanted_fips, cache, log=print):
     """Read CHAS Table 8 for the given summary levels -> ({FIPS: row}, [source URLs]).
     A level that cannot be downloaded or read is skipped with a log line; a cached file that is
-    not a zip (for example an error page) is deleted so the next run tries again."""
+    not a zip (HUD's site serves scripts a web page instead) is deleted so the next run tries
+    again, and the log says where to save the zip after downloading it in a browser."""
     chas, sources = {}, []
     for level in levels:
         url = chas_url(period, level)
@@ -941,9 +1016,12 @@ def load_chas(period, levels, wanted_fips, cache, log=print):
         try:
             rows = read_chas_table8(chas_table8_lines(path), wanted_fips)
         except (zipfile.BadZipFile, ValueError, csv.Error) as exc:
-            log("skip HUD CHAS %s: %s" % (level, exc))
             if isinstance(exc, zipfile.BadZipFile):
                 os.remove(path)
+                log("skip HUD CHAS %s: HUD sent a web page, not the zip. Download %s in a browser "
+                    "(from %s) and save it as %s, then run again." % (level, url, CHAS_PAGE, path))
+            else:
+                log("skip HUD CHAS %s: %s" % (level, exc))
             continue
         log("read HUD CHAS %s: %d geographies" % (level, len(rows)))
         chas.update(rows)

@@ -126,6 +126,15 @@ def county_acs():
     return {t: {COUNTY: r} for t, r in tables.items()}
 
 
+def jammed_acs():
+    """county_acs() with open-ended medians, as the live 2020-2024 files publish them for
+    Bow Mar, Colorado: rent 3501 and value 2000001, with no margin of error."""
+    acs = county_acs()
+    acs["b25064"][COUNTY] = row("b25064", {1: 3501})
+    acs["b25077"][COUNTY] = row("b25077", {1: 2000001})
+    return acs
+
+
 def permits():
     return {2024: hp.read_bps_county(BPS_2024), 2025: hp.read_bps_county(BPS_2025)}
 
@@ -150,6 +159,7 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(hp.parse_value("-999999999", is_moe=True))
         self.assertEqual(hp.parse_value("-555555555", is_moe=True), 0.0)
         self.assertIsNone(hp.parse_value("-555555555"))
+        self.assertIsNone(hp.parse_value("-333333333", is_moe=True))
         self.assertEqual(hp.parse_value("-5"), -5.0)
 
     def test_read_acs_table_filters(self):
@@ -275,7 +285,11 @@ class ChasParseTests(unittest.TestCase):
             self.assertEqual(sorted(chas), ["08123"])
             self.assertEqual(sources, ["https://www.huduser.gov/portal/datasets/cp/2018thru2022-050-csv.zip"])
             self.assertFalse(os.path.exists(bad))
-            self.assertTrue(any(msg.startswith("skip HUD CHAS 040") for msg in logged))
+            skipped = [msg for msg in logged if msg.startswith("skip HUD CHAS 040")]
+            self.assertEqual(len(skipped), 1)
+            # The log line tells the user where to get the zip and where to save it.
+            self.assertIn(hp.CHAS_PAGE, skipped[0])
+            self.assertIn(bad, skipped[0])
             empty = os.path.join(tmp, "empty.zip")
             with zipfile.ZipFile(empty, "w") as zf:
                 zf.writestr("050/Table9.csv", "x\n")
@@ -296,6 +310,28 @@ class MathTests(unittest.TestCase):
         self.assertAlmostEqual(hp.moe_proportion(80, 100, 5, 20), 281 ** 0.5 / 100)
         self.assertIsNone(hp.moe_proportion(1, 0, 1, 1))
         self.assertIsNone(hp.moe_proportion(1, 2, None, 1))
+
+    def test_acs_bound(self):
+        self.assertEqual(hp.acs_bound("b25077", 2000001.0, None), (2000000.0, "at_least"))
+        self.assertEqual(hp.acs_bound("b25077", 9999.0, None), (10000.0, "at_most"))
+        self.assertEqual(hp.acs_bound("b25064", 3501.0, None), (3500.0, "at_least"))
+        self.assertEqual(hp.acs_bound("b25064", 99.0, None), (100.0, "at_most"))
+        self.assertEqual(hp.acs_bound("b19013", 250001.0, None), (250000.0, "at_least"))
+        self.assertEqual(hp.acs_bound("b25119", 2499.0, None), (2500.0, "at_most"))
+        # A value that happens to equal a jam value but has a margin of error is a real estimate.
+        self.assertEqual(hp.acs_bound("b25064", 3501.0, 120.0), (3501.0, None))
+        self.assertEqual(hp.acs_bound("b25064", 1755.0, None), (1755.0, None))
+        self.assertEqual(hp.acs_bound("b01003", 2000001.0, None), (2000001.0, None))
+        self.assertEqual(hp.acs_bound("b25077", None, None), (None, None))
+
+    def test_ratio_bound(self):
+        self.assertIsNone(hp.ratio_bound(None, None))
+        self.assertEqual(hp.ratio_bound("at_least", None), "at_least")
+        self.assertEqual(hp.ratio_bound(None, "at_least"), "at_most")
+        self.assertEqual(hp.ratio_bound(None, "at_most"), "at_least")
+        self.assertEqual(hp.ratio_bound("at_least", "at_most"), "at_least")
+        self.assertEqual(hp.ratio_bound("at_least", "at_least"), "unknown")
+        self.assertEqual(hp.ratio_bound("at_most", "at_most"), "unknown")
 
 
 class ChasSummaryTests(unittest.TestCase):
@@ -356,6 +392,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(p["acs"], "2020-2024 ACS 5-year estimates")
         self.assertEqual(list(p["metrics"]), hp.METRIC_KEYS)
         self.assertIsNone(p["chas"])
+        self.assertTrue(all(v["bound"] is None for v in p["metrics"].values()))
 
     def test_occupancy_and_vacancy(self):
         self.assertEqual(self.m["population"], 750000)
@@ -384,6 +421,40 @@ class ProfileTests(unittest.TestCase):
         self.assertAlmostEqual(self.m["severely_rent_burdened_share"], 20000 / 101000, places=4)
         self.assertAlmostEqual(self.m["owner_burdened_share"], 20000 / 178500, places=4)
         self.assertAlmostEqual(self.m["severely_owner_burdened_share"], 7000 / 178500, places=4)
+
+    def test_open_ended_medians(self):
+        p = hp.build_profile(COUNTY, "El Paso County, Colorado", jammed_acs(), permits(), 2024)
+        mt = p["metrics"]
+        self.assertEqual((mt["median_gross_rent"]["value"], mt["median_gross_rent"]["bound"]),
+                         (3500, "at_least"))
+        self.assertIsNone(mt["median_gross_rent"]["moe"])
+        self.assertEqual((mt["median_home_value"]["value"], mt["median_home_value"]["bound"]),
+                         (2000000, "at_least"))
+        self.assertEqual((mt["income_needed_for_median_rent"]["value"],
+                          mt["income_needed_for_median_rent"]["bound"]), (140000, "at_least"))
+        # Renter income (exact) over a need that is at least $140,000: at most 60,000 / 140,000.
+        self.assertEqual(mt["renter_income_to_needed_ratio"]["bound"], "at_most")
+        self.assertAlmostEqual(mt["renter_income_to_needed_ratio"]["value"], 0.43)
+        self.assertEqual(mt["value_to_income_ratio"]["bound"], "at_least")
+        self.assertAlmostEqual(mt["value_to_income_ratio"]["value"], 22.22)
+        self.assertIsNone(mt["median_household_income"]["bound"])
+        md = hp.render_markdown(p)
+        self.assertIn("| Median gross rent (monthly) | $3,500+ |  | B25064_E001 |", md)
+        self.assertIn("| Median home value (owner-occupied) | $2,000,000+ |  | B25077_E001 |", md)
+        self.assertIn("| Median renter income / income needed for median rent | under 0.43 |", md)
+        self.assertIn("open-ended top or bottom interval", md)
+        self.assertNotIn("open-ended", hp.render_markdown(self.profile))
+
+    def test_open_ended_ratio_unknown(self):
+        acs = jammed_acs()
+        acs["b19013"][COUNTY] = row("b19013", {1: 250001})
+        p = hp.build_profile(COUNTY, "El Paso County, Colorado", acs, permits(), 2024)
+        mt = p["metrics"]
+        self.assertEqual((mt["median_household_income"]["value"], mt["median_household_income"]["bound"]),
+                         (250000, "at_least"))
+        # $2,000,000+ over $250,000+ could be anything.
+        self.assertIsNone(mt["value_to_income_ratio"]["value"])
+        self.assertIsNone(mt["value_to_income_ratio"]["bound"])
 
     def test_share_moe_present(self):
         moe = self.profile["metrics"]["rent_burdened_share"]["moe"]
@@ -451,6 +522,9 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(hp.fmt(0.4059, "share"), "40.6%")
         self.assertEqual(hp.fmt(5, "ratio"), "5.00")
         self.assertEqual(hp.fmt(None, "usd"), "n/a")
+        self.assertEqual(hp.fmt(2000000, "usd", "at_least"), "$2,000,000+")
+        self.assertEqual(hp.fmt(10000, "usd", "at_most"), "under $10,000")
+        self.assertEqual(hp.fmt(None, "usd", "at_least"), "n/a")
         self.assertEqual(hp.slugify("Doña Ana County, New Mexico"), "dona-ana-county")
         self.assertEqual(hp.slugify("Colorado Springs city, Colorado"), "colorado-springs-city")
 
@@ -476,6 +550,16 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(len(hp.csv_row(p)), len(hp.csv_header()))
         empty = hp.build_profile(PLACE, "X city, Colorado", {}, {}, 2024)
         self.assertEqual(len(hp.csv_row(empty)), len(hp.csv_header()))
+
+    def test_csv_bound_columns(self):
+        header = hp.csv_header()
+        self.assertEqual(len([c for c in header if c.endswith("_bound")]), len(hp.BOUND_KEYS))
+        self.assertEqual(header.index("median_home_value_bound"), header.index("median_home_value_moe") + 1)
+        p = hp.build_profile(COUNTY, "El Paso County, Colorado", jammed_acs(), permits(), 2024)
+        got = dict(zip(header, hp.csv_row(p)))
+        self.assertEqual(got["median_home_value"], 2000000)
+        self.assertEqual(got["median_home_value_bound"], "at_least")
+        self.assertEqual(got["median_household_income_bound"], "")
 
     def test_csv_chas_columns(self):
         p = hp.build_profile("0500000US08123", "Weld County, Colorado", {}, {}, 2024, weld_chas())
@@ -510,14 +594,23 @@ class OutputTests(unittest.TestCase):
             with open(os.path.join(tmp, "CO", "counties", "08041-el-paso-county.json"), encoding="utf-8") as fh:
                 data = json.load(fh)
             self.assertEqual(data["metrics"]["median_gross_rent"]["value"], 1755)
+            self.assertIsNone(data["metrics"]["median_gross_rent"]["bound"])
             with open(os.path.join(tmp, "CO", "README.md"), encoding="utf-8") as fh:
                 index = fh.read()
             self.assertIn("[El Paso County](counties/08041-el-paso-county.md)", index)
             self.assertIn("Places with 1,000+ residents (2)", index)
             self.assertIn("| [Denver city](places/0820000-denver-city.md) | n/a | n/a | n/a | n/a | n/a | 4,561 |",
                           index)
+            self.assertIn("its permits are counted in its county's figures", index)
             with open(os.path.join(tmp, "counties.csv"), encoding="utf-8") as fh:
                 self.assertEqual(len(fh.read().strip().splitlines()), 2)
+
+    def test_state_index_open_ended(self):
+        state = hp.build_profile(STATE, "Colorado", {}, {}, 2024)
+        county = hp.build_profile(COUNTY, "El Paso County, Colorado", jammed_acs(), permits(), 2024)
+        index = hp.render_state_index(state, [county], [], {"places_min_pop": 1000})
+        self.assertIn("| $3,500+ | $2,000,000+ |", index)
+        self.assertNotIn("counted in its county's figures", index)
 
 
 if __name__ == "__main__":

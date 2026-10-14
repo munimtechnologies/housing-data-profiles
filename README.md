@@ -4,6 +4,9 @@ Housing data profiles for every U.S. state and county, and for the cities and to
 state you choose, built only from public Census Bureau and HUD files. **No API key, no
 third-party packages, one Python file.**
 
+**See it:** [Colorado, all 64 counties and 220 towns](reports/CO/README.md), built on
+2026-10-14 ahead of the state's December 31, 2026 housing needs assessment deadline.
+
 Each profile covers the numbers a housing needs assessment usually starts with:
 
 - **People and households:** population, owner and renter households, renter share
@@ -16,10 +19,10 @@ Each profile covers the numbers a housing needs assessment usually starts with:
 - **Affordability:** the income needed to rent at the median without cost burden, renter
   income against that need, value-to-income ratio, and the share of renters and owners who
   are cost-burdened (30%+) or severely cost-burdened (50%+)
-- **Cost burden by income (new in 0.3.0):** from HUD's CHAS data, how many households in
-  each income band (0-30%, 30-50%, 50-80%, 80-100% and over 100% of HUD Area Median Family
-  Income) pay more than 30% or more than 50% of income for housing, with renters shown
-  separately and a total for all households at or under 80% of area median income
+- **Cost burden by income:** from HUD's CHAS data, how many households in each income band
+  (0-30%, 30-50%, 50-80%, 80-100% and over 100% of HUD Area Median Family Income) pay more
+  than 30% or more than 50% of income for housing, with renters shown separately and a total
+  for all households at or under 80% of area median income
 - **New supply:** housing units authorized by building permits, by year and structure type,
   with an annual rate per 1,000 existing units, for states, counties and every city or town
   that issues its own permits
@@ -38,8 +41,15 @@ python housing_profile.py --states UT,ID --detail-states UT --places-min-pop 250
 python -m unittest -v
 ```
 
-The first run downloads the national ACS table files (about 500 MB) and HUD's CHAS zips into
-`.cache/`. After that, any state runs in seconds.
+The first run downloads the national ACS table files (about 500 MB) into `.cache/`. After
+that, any state runs in seconds.
+
+**HUD CHAS zips need one manual step.** As of October 2026, HUD's site sends scripts a web
+page instead of the CHAS zip files, so the run carries on without CHAS and its log names the
+exact file to fetch. Open the [CHAS page](https://www.huduser.gov/portal/datasets/cp.html) in
+a browser (no sign-in needed), choose 2018-2022, and download the CSV zips for State, County
+and Place. HUD's file names already match, so just put them in `.cache/`:
+`2018thru2022-040-csv.zip`, `2018thru2022-050-csv.zip` and `2018thru2022-160-csv.zip`.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -50,38 +60,36 @@ The first run downloads the national ACS table files (about 500 MB) and HUD's CH
 | `--permit-years` | 2016-2025 | Building permit years; missing years are skipped |
 | `--chas-period` | `2018thru2022` | HUD CHAS period; pass `""` to skip CHAS |
 | `--chas-levels` | `040,050,160` | CHAS summary levels: states, counties, places |
-
-If HUD's site refuses the scripted CHAS download, the run carries on without CHAS and says so.
-You can then download the zips yourself from the
-[CHAS page](https://www.huduser.gov/portal/datasets/cp.html) (2018-2022; State, County and
-Place) and put them in `.cache/` under their original names, for example
-`.cache/2018thru2022-050-csv.zip`.
+| `--cache` | `.cache` | Download cache folder |
 
 Output (in `--out`):
 
 - `states.csv` and `counties.csv`: one row per state and county, with every metric and its
-  margin of error, plus the CHAS columns (`chas_<band>_<field>`, bands `le30`, `30_50`,
-  `50_80`, `le80` and `all`)
+  margin of error, a `<metric>_bound` column for medians and the ratios built from them, and
+  the CHAS columns (`chas_<band>_<field>`, bands `le30`, `30_50`, `50_80`, `le80` and `all`)
 - `<ST>/` for each detail state: a Markdown and JSON profile for the state, each county and
   each place above the population cutoff, plus `counties.csv`, `places.csv` and an index
   `README.md`
+- `manifest.json`: version, run time, data periods and every source URL used
 
 ## Colorado first
 
 Under SB24-174, Colorado local governments that meet the population thresholds must complete
 a housing needs assessment by **December 31, 2026**, using the Department of Local Affairs
-(DOLA) methodology. `--detail-states CO` gives a free, reproducible starting data set for
-that work: the state, all 64 counties and every place with 1,000+ residents, including each
-town's own building permits for 2016-2025 and cost burden by income band. These are **not** a
-complete or DOLA-approved assessment. DOLA's guidance and the State Demography Office's data
-are the official sources for compliance.
+(DOLA) methodology, which relies on publicly available data. `--detail-states CO` gives a
+free, reproducible starting data set for that work: the state, all 64 counties and every
+place with 1,000+ residents, including each town's own building permits for 2016-2025 and
+cost burden by income band. The [published Colorado reports](reports/CO/README.md) are one
+such run. These are **not** a complete or DOLA-approved assessment. DOLA's guidance and the
+State Demography Office's data are the official sources for compliance.
 
 ## Monthly report build
 
 [`docs/refresh-workflow.yml`](docs/refresh-workflow.yml) is a GitHub Actions workflow that
 runs the tests, rebuilds `reports/` for all states with Colorado in detail, and commits any
 change, once a month. Copy it to `.github/workflows/refresh.yml` in your fork (or here) to
-turn it on.
+turn it on. Because of HUD's download block, add the CHAS zips to the cache first or the
+reports will have no CHAS section.
 
 ## Sources
 
@@ -108,7 +116,14 @@ turn it on.
   (renters); inside a band that starts at column s, s+4 is a cost burden over 30% to 50% and
   s+7 over 50%. This was checked against HUD's published field definitions and derived totals
   for Weld County, Colorado (for example, 20,990 cost-burdened and 11,110 severely
-  cost-burdened households at or under 80% of HAMFI), which the tests reproduce.
+  cost-burdened households at or under 80% of HAMFI, from HUD's map layer), which the tests
+  reproduce. In the real 2018-2022 run the Weld County income bands add up to their totals.
+- **Open-ended medians:** when a median falls in the ACS's top or bottom interval, the
+  Census Bureau publishes only that edge (for example, median home value "2,000,000+",
+  median gross rent "3,500+", median income "250,000+"). Profiles show these as
+  "$2,000,000+" or "under $10,000", the JSON and CSV carry the edge with
+  `"bound": "at_least"` or `"at_most"`, and ratios built from them are marked as bounds too
+  (or left blank when the two sides pull in opposite directions).
 - **Income needed for median rent:** median gross rent x 12 / 0.30.
 - **Rental vacancy rate:** units for rent / (renter-occupied + rented, not occupied + for rent),
   the Census Bureau's definition. The homeowner rate is built the same way from for-sale units.
@@ -120,13 +135,22 @@ turn it on.
   not line up, and CHAS 2018-2022 may still use the old Connecticut counties.
 - **Place permits** come from the permit office whose FIPS place code matches the ACS place.
   Unincorporated county areas (FIPS place 99990) and county-wide offices (00000) are not
-  places, so they only count toward their county. A town whose permits are issued by its
-  county has no place permit section. In New England and other states where townships
-  (minor civil divisions) issue permits, many offices have no FIPS place code and are skipped.
+  places, so they only count toward their county. A town whose permits are issued by a county
+  or regional building department has no place permit section: for example, Colorado
+  Springs, Fountain and Monument are permitted by the Pikes Peak Regional Building
+  Department and appear only in El Paso County's figures. In New England and other states
+  where townships (minor civil divisions) issue permits, many offices have no FIPS place code
+  and are skipped.
 - These are informational data profiles. They are not legal, compliance or investment advice.
 
 ## Changes
 
+- **0.3.1:** medians in the ACS's open-ended top or bottom interval are shown as bounds
+  ("$2,000,000+") instead of the raw code ("$2,000,001"), with `bound` in the JSON, new
+  `<metric>_bound` CSV columns, and bounds carried into the ratios built from them; a CHAS
+  download that HUD blocks now logs the exact file to fetch and where to save it; the state
+  index explains places with no permit office of their own. First published Colorado
+  reports (`reports/CO/`, from the first full run on 2026-10-14).
 - **0.3.0:** cost burden by household income band from HUD CHAS Table 8 (states, counties and
   places), in the Markdown, JSON and CSV outputs; a CHAS download that fails is skipped
   instead of stopping the run.
@@ -138,7 +162,8 @@ turn it on.
 ## About
 
 Made by MV2 of Munim, Inc., with AI agents. The code is tested on fixtures that mirror the
-real Census and HUD file layouts. Issues and corrections are welcome. MIT license.
+real Census and HUD file layouts, and it was run end to end on live Census and HUD files for
+Colorado on 2026-10-14 (285 profiles). Issues and corrections are welcome. MIT license.
 
 This product uses Census Bureau data but is not endorsed or certified by the Census Bureau.
 It also uses HUD CHAS data and is not endorsed by HUD.
