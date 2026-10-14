@@ -15,7 +15,7 @@ Sources:
 Every metric carries its source table and formula, and ACS margins of error are kept
 (and propagated for derived shares, using the Census Bureau's approximation formulas).
 
-By MV2 of Munim, Inc. Made with AI agents. Apache-2.0 license.
+By MV2 of Munim, Inc. Made with AI agents. MIT license.
 This product uses Census Bureau data but is not endorsed or certified by the Census Bureau.
 It also uses HUD CHAS data and is not endorsed by HUD.
 """
@@ -35,9 +35,9 @@ import urllib.error
 import urllib.request
 import zipfile
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
-REPO_URL = "https://github.com/munimtechnologies/housing-data-profiles"
+REPO_URL = "https://github.com/munimv2/housing-data-profiles"
 USER_AGENT = "housing-data-profiles/%s (MV2 of Munim, Inc.; %s)" % (__version__, REPO_URL)
 
 ACS_BASE = "https://www2.census.gov/programs-surveys/acs/summary_file/{year}/table-based-SF/"
@@ -68,6 +68,8 @@ NEEDED_LINES = {
     "b25091": list(range(1, 24)),   # mortgage status by owner costs as a percentage of income
     "b25024": list(range(1, 12)),   # units in structure
     "b25034": list(range(1, 12)),   # year structure built
+    "b25063": list(range(1, 28)),   # gross rent
+    "b25118": list(range(1, 26)),   # tenure by household income
 }
 ACS_TABLES = list(NEEDED_LINES)
 
@@ -161,6 +163,25 @@ CHAS_GROUPS = [(key, label, [key]) for key, label, _, _ in CHAS_BANDS] + [
 CHAS_CSV_GROUPS = ["le30", "30_50", "50_80", "le80", "all"]
 CHAS_CSV_FIELDS = ["households", "renter_households", "cost_burdened", "cost_burdened_share",
                    "severely_cost_burdened", "severely_cost_burdened_share"]
+
+# ACS B25063 (gross rent, renter-occupied units): line -> the bracket's upper edge (exclusive).
+# Line 2 is "with cash rent", line 26 "$3,500 or more" and line 27 "no cash rent".
+B25063_RENT_EDGES = {
+    3: 100, 4: 150, 5: 200, 6: 250, 7: 300, 8: 350, 9: 400, 10: 450, 11: 500, 12: 550,
+    13: 600, 14: 650, 15: 700, 16: 750, 17: 800, 18: 900, 19: 1000, 20: 1250, 21: 1500,
+    22: 2000, 23: 2500, 24: 3000, 25: 3500,
+}
+# ACS B25118 (tenure by household income): renter line -> the bracket's upper edge (exclusive).
+# Line 14 is all renter-occupied units and line 25 "$150,000 or more".
+B25118_RENTER_EDGES = {
+    15: 5000, 16: 10000, 17: 15000, 18: 20000, 19: 25000, 20: 35000, 21: 50000, 22: 75000,
+    23: 100000, 24: 150000,
+}
+# The rent ladder's incomes. Each is a B25118 edge whose affordable rent (30% of income, over 12
+# months: income / 40) is a B25063 edge, so no bracket is split: $500, $1,250 and $2,500 a month.
+# (key, annual income limit)
+RENT_LADDER = [("lt20k", 20000), ("lt50k", 50000), ("lt100k", 100000)]
+RENT_LADDER_CSV_FIELDS = ["renter_households", "units", "units_per_100", "gap"]
 
 
 # ---------------------------------------------------------------- parsing
@@ -408,6 +429,15 @@ def moe_proportion(num, den, moe_num, moe_den):
     return math.sqrt(radicand) / den
 
 
+def moe_ratio(num, den, moe_num, moe_den):
+    """Margin of error of a ratio num/den whose numerator is not a subset of its denominator
+    (Census Bureau ACS handbook formula)."""
+    if None in (num, den, moe_num, moe_den) or den == 0:
+        return None
+    r = num / den
+    return math.sqrt(moe_num ** 2 + r * r * moe_den ** 2) / den
+
+
 def acs_bound(table, value, moe):
     """An ACS median -> (value, bound). A median published at its table's jam value with no
     margin of error is in an open-ended interval: it becomes the interval's edge, with bound
@@ -489,6 +519,58 @@ def summarize_permits(series, housing_units):
         "avg_annual_units": round(avg, 1),
         "multifamily_share": round(multi / total, 4) if total else None,
         "avg_annual_per_1000_units": round(per_1000, 2) if per_1000 is not None else None,
+    }
+
+
+def lines_under(edges, limit):
+    """The lines of a bracketed ACS table whose whole bracket is under `limit`. `limit` must be
+    a bracket edge, so that no bracket is split."""
+    if limit not in edges.values():
+        raise ValueError("%s is not a bracket edge" % limit)
+    return [line for line, edge in sorted(edges.items()) if edge <= limit]
+
+
+def rent_ladder(acs, geo_id):
+    """Renter households below each RENT_LADDER income (ACS B25118) against renter-occupied
+    units whose gross rent is under 30% of that income (ACS B25063), or None. A negative gap
+    means fewer such units than households."""
+    incomes = acs.get("b25118", {}).get(geo_id)
+    rents = acs.get("b25063", {}).get(geo_id)
+    if not incomes or not rents:
+        return None
+
+    def total(row, table, lines):
+        return (_sum(row.get(acs_column(table, n)) for n in lines),
+                moe_sum(row.get(acs_column(table, n, moe=True)) for n in lines))
+
+    rungs = []
+    for key, income in RENT_LADDER:
+        rent = income // 40
+        households, households_moe = total(incomes, "b25118", lines_under(B25118_RENTER_EDGES, income))
+        units, units_moe = total(rents, "b25063", lines_under(B25063_RENT_EDGES, rent))
+        per_100 = _ratio(units, households)
+        per_100_moe = moe_ratio(units, households, units_moe, households_moe)
+        rungs.append({
+            "key": key,
+            "income_limit": income,
+            "rent_limit": rent,
+            "renter_households": _clean(households, "count"),
+            "renter_households_moe": _clean(households_moe, "count"),
+            "units": _clean(units, "count"),
+            "units_moe": _clean(units_moe, "count"),
+            "units_per_100": None if per_100 is None else round(per_100 * 100, 1),
+            "units_per_100_moe": None if per_100_moe is None else round(per_100_moe * 100, 1),
+            "gap": _clean(_diff(units, households), "count"),
+            "gap_moe": _clean(moe_sum([units_moe, households_moe]), "count"),
+        })
+    no_cash, no_cash_moe = total(rents, "b25063", [27])
+    return {
+        "source": "ACS B25118 (renter households by income) and B25063 (gross rent)",
+        "rungs": rungs,
+        "renter_households": _clean(incomes.get(acs_column("b25118", 14)), "count"),
+        "units_with_cash_rent": _clean(rents.get(acs_column("b25063", 2)), "count"),
+        "no_cash_rent_units": _clean(no_cash, "count"),
+        "no_cash_rent_units_moe": _clean(no_cash_moe, "count"),
     }
 
 
@@ -675,6 +757,7 @@ def build_profile(geo_id, name, acs, permits_by_year=None, acs_year=DEFAULT_ACS_
         "name": name,
         "acs": "%d-%d ACS 5-year estimates" % (acs_year - 4, acs_year),
         "metrics": {key: metrics[key] for key in METRIC_KEYS},
+        "rent_ladder": rent_ladder(acs, geo_id),
         "permits": permits,
         "chas": chas_summary((chas or {}).get(fips), chas_period),
     }
@@ -705,6 +788,13 @@ def fmt_metric(metric):
     return fmt(metric["value"], metric["unit"], metric.get("bound"))
 
 
+def fmt_moe(value, moe, unit):
+    """A value with its margin of error, '22,000 +/- 600', or just the value if there is none."""
+    if value is None or moe is None:
+        return fmt(value, unit)
+    return "%s +/- %s" % (fmt(value, unit), fmt(moe, unit))
+
+
 def slugify(text):
     text = unicodedata.normalize("NFKD", text.split(",")[0]).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "geo"
@@ -712,6 +802,40 @@ def slugify(text):
 
 def file_stem(profile):
     return "%s-%s" % (profile["fips"], slugify(profile["name"]))
+
+
+def render_rent_ladder(ladder):
+    lines = ["## Rents renters can afford (ACS)", ""]
+    if not ladder:
+        return lines + ["No ACS gross rent or renter income record for this geography.", ""]
+    lines += [
+        "Renter households earning under each income, and the renter-occupied units whose gross rent "
+        "(rent plus utilities) is under 30% of that income. Fewer units than households means renters at "
+        "that income cannot all have a unit they can afford. Some of those units are rented by "
+        "higher-income households, so this count is an upper limit on what is open to them.",
+        "",
+        "| Renter household income | Renter households | Affordable gross rent | Units renting below it | "
+        "Units per 100 households | Units minus households |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for r in ladder["rungs"]:
+        gap = fmt(r["gap"], "count")
+        if r["gap"] is not None and r["gap"] > 0:
+            gap = "+" + gap
+        lines.append("| Under %s a year | %s | Under %s a month | %s | %s | %s |" % (
+            fmt(r["income_limit"], "usd"),
+            fmt_moe(r["renter_households"], r["renter_households_moe"], "count"),
+            fmt(r["rent_limit"], "usd"),
+            fmt_moe(r["units"], r["units_moe"], "count"),
+            fmt(r["units_per_100"], "count"), gap))
+    lines += [
+        "",
+        "Households: renter-occupied lines of B25118 below each income. Units: B25063 gross rent brackets "
+        "below each rent. %s renter-occupied units pay no cash rent; their households are counted, the "
+        "units are not." % fmt(ladder["no_cash_rent_units"], "count"),
+        "",
+    ]
+    return lines
 
 
 def render_chas(chas):
@@ -751,6 +875,7 @@ def render_markdown(profile, meta=None):
             moe = "+/- " + fmt(mt["moe"], mt["unit"]) if mt["moe"] is not None else ""
             lines.append("| %s | %s | %s | %s |" % (mt["label"], fmt_metric(mt), moe, mt["source"]))
         lines.append("")
+    lines += render_rent_ladder(profile.get("rent_ladder"))
     lines += render_chas(profile.get("chas"))
     permits = profile.get("permits")
     lines += ["## New housing authorized by building permits", ""]
@@ -783,6 +908,9 @@ def render_markdown(profile, meta=None):
     lines += [
         "- \"Cost-burdened\" means paying 30% or more of household income on housing; \"severely\" means "
         "50% or more. Households whose cost ratio cannot be computed are left out of the denominator.",
+        "- The rent table uses fixed dollar incomes, not shares of area median income, and compares last "
+        "year's incomes with current rents; vacant units for rent are not counted. HUD's CHAS data measure "
+        "the same gap against HAMFI.",
         "- The HUD CHAS figures are a special tabulation of an earlier ACS period, rounded by HUD, and use "
         "HUD's definitions: over 30% and over 50% of income, with households whose cost burden is not "
         "computed kept in the denominator, as in HUD's own summaries. They will not match the ACS "
@@ -810,6 +938,7 @@ def csv_header():
     cols += ["permit_years", "permits_total_units", "permits_avg_annual_units",
              "permits_multifamily_share", "permits_avg_annual_per_1000_units"]
     cols += ["chas_%s_%s" % (g, field) for g in CHAS_CSV_GROUPS for field in CHAS_CSV_FIELDS]
+    cols += ["rent_ladder_%s_%s" % (key, field) for key, _ in RENT_LADDER for field in RENT_LADDER_CSV_FIELDS]
     return cols
 
 
@@ -833,6 +962,11 @@ def csv_row(profile):
     for key in CHAS_CSV_GROUPS:
         g = groups.get(key, {})
         row += ["" if g.get(field) is None else g[field] for field in CHAS_CSV_FIELDS]
+    ladder = profile.get("rent_ladder")
+    rungs = {r["key"]: r for r in ladder["rungs"]} if ladder else {}
+    for key, _ in RENT_LADDER:
+        r = rungs.get(key, {})
+        row += ["" if r.get(field) is None else r[field] for field in RENT_LADDER_CSV_FIELDS]
     return row
 
 
@@ -1100,6 +1234,7 @@ def run(args, log=print):
         "permit_span": "%d-%d" % (loaded[0], loaded[-1]) if loaded else "",
         "chas": "HUD CHAS %s, Table 8" % chas_period_label(chas_period) if chas else "",
         "chas_profiles": sum(1 for p in profiles if p["chas"]),
+        "rent_ladder_profiles": sum(1 for p in profiles if p["rent_ladder"]),
         "states": [STATES[s] for s in states],
         "detail_states": [STATES[s] for s in detail],
         "places_min_pop": args.places_min_pop,

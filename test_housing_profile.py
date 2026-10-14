@@ -122,6 +122,18 @@ def county_acs():
         "b25034": row("b25034", {1: 300000, 2: 15000, 3: 45000, 4: 50000, 5: 40000, 6: 75000,
                                  7: 30000, 8: 20000, 9: 15000, 10: 5000, 11: 5000},
                       {n: 400 for n in range(1, 12)}),
+        # Gross rent: 9,000 units under $500, 36,000 under $1,250, 96,000 under $2,500;
+        # lines 3-26 add up to line 2 (with cash rent), and line 2 + line 27 to line 1.
+        "b25063": row("b25063", {**{n: 1000 for n in range(3, 12)}, **{n: 3000 for n in range(12, 21)},
+                                 1: 105000, 2: 102000, 21: 20000, 22: 30000, 23: 10000,
+                                 24: 3000, 25: 2000, 26: 1000, 27: 3000},
+                      {n: 200 for n in range(1, 28)}),
+        # Renter incomes (lines 15-25 add up to line 14): 22,000 under $20,000, 56,000 under
+        # $50,000, 90,000 under $100,000.
+        "b25118": row("b25118", {1: 285000, 2: 180000, 14: 105000, 15: 5000, 16: 5000, 17: 6000,
+                                 18: 6000, 19: 7000, 20: 12000, 21: 15000, 22: 20000, 23: 14000,
+                                 24: 10000, 25: 5000},
+                      {n: 300 for n in range(1, 26)}),
     }
     return {t: {COUNTY: r} for t, r in tables.items()}
 
@@ -311,6 +323,12 @@ class MathTests(unittest.TestCase):
         self.assertIsNone(hp.moe_proportion(1, 0, 1, 1))
         self.assertIsNone(hp.moe_proportion(1, 2, None, 1))
 
+    def test_moe_ratio(self):
+        # sqrt(30^2 + 2^2 * 10^2) / 50 = sqrt(1300) / 50
+        self.assertAlmostEqual(hp.moe_ratio(100, 50, 30, 10), 1300 ** 0.5 / 50)
+        self.assertIsNone(hp.moe_ratio(1, 0, 1, 1))
+        self.assertIsNone(hp.moe_ratio(1, 2, 1, None))
+
     def test_acs_bound(self):
         self.assertEqual(hp.acs_bound("b25077", 2000001.0, None), (2000000.0, "at_least"))
         self.assertEqual(hp.acs_bound("b25077", 9999.0, None), (10000.0, "at_most"))
@@ -381,6 +399,85 @@ class ChasSummaryTests(unittest.TestCase):
         self.assertIsNone(le30["households_moe"])
 
 
+class RentLadderTests(unittest.TestCase):
+    def setUp(self):
+        self.ladder = hp.rent_ladder(county_acs(), COUNTY)
+        self.r = {r["key"]: r for r in self.ladder["rungs"]}
+
+    def test_layout(self):
+        # Bracket edges as published in the Census Bureau's variable list for B25063 and B25118
+        # (2024 ACS 5-year): B25063_011 is "$450 to $499", B25063_020 "$1,000 to $1,249",
+        # B25063_023 "$2,000 to $2,499"; B25118_018 is renter "$15,000 to $19,999", B25118_021
+        # "$35,000 to $49,999", B25118_023 "$75,000 to $99,999".
+        self.assertEqual(sorted(hp.B25063_RENT_EDGES), list(range(3, 26)))
+        self.assertEqual(sorted(hp.B25118_RENTER_EDGES), list(range(15, 25)))
+        self.assertEqual(hp.NEEDED_LINES["b25063"], list(range(1, 28)))
+        self.assertEqual(hp.NEEDED_LINES["b25118"], list(range(1, 26)))
+        self.assertEqual(hp.lines_under(hp.B25063_RENT_EDGES, 500), list(range(3, 12)))
+        self.assertEqual(hp.lines_under(hp.B25063_RENT_EDGES, 1250), list(range(3, 21)))
+        self.assertEqual(hp.lines_under(hp.B25063_RENT_EDGES, 2500), list(range(3, 24)))
+        self.assertEqual(hp.lines_under(hp.B25118_RENTER_EDGES, 20000), [15, 16, 17, 18])
+        self.assertEqual(hp.lines_under(hp.B25118_RENTER_EDGES, 50000), list(range(15, 22)))
+        self.assertEqual(hp.lines_under(hp.B25118_RENTER_EDGES, 100000), list(range(15, 24)))
+        with self.assertRaises(ValueError):
+            hp.lines_under(hp.B25063_RENT_EDGES, 625)
+        for _, income in hp.RENT_LADDER:
+            self.assertIn(income, hp.B25118_RENTER_EDGES.values())
+            self.assertIn(income // 40, hp.B25063_RENT_EDGES.values())
+            self.assertAlmostEqual(income * 0.30 / 12, income // 40)
+
+    def test_rungs(self):
+        self.assertEqual([r["key"] for r in self.ladder["rungs"]], ["lt20k", "lt50k", "lt100k"])
+        lt20k = self.r["lt20k"]
+        self.assertEqual((lt20k["income_limit"], lt20k["rent_limit"]), (20000, 500))
+        self.assertEqual(lt20k["renter_households"], 22000)
+        self.assertEqual(lt20k["renter_households_moe"], 600)   # sqrt(4) x 300
+        self.assertEqual(lt20k["units"], 9000)
+        self.assertEqual(lt20k["units_moe"], 600)               # sqrt(9) x 200
+        self.assertEqual(lt20k["gap"], -13000)
+        self.assertEqual(lt20k["gap_moe"], 849)                 # sqrt(600^2 + 600^2)
+        self.assertAlmostEqual(lt20k["units_per_100"], 40.9)
+        self.assertAlmostEqual(lt20k["units_per_100_moe"], 2.9)
+        lt50k = self.r["lt50k"]
+        self.assertEqual((lt50k["renter_households"], lt50k["units"], lt50k["gap"]), (56000, 36000, -20000))
+        self.assertEqual((lt50k["renter_households_moe"], lt50k["units_moe"]), (794, 849))
+        self.assertAlmostEqual(lt50k["units_per_100"], 64.3)
+        lt100k = self.r["lt100k"]
+        self.assertEqual((lt100k["rent_limit"], lt100k["renter_households"], lt100k["units"], lt100k["gap"]),
+                         (2500, 90000, 96000, 6000))
+        self.assertAlmostEqual(lt100k["units_per_100"], 106.7)
+        self.assertEqual(self.ladder["renter_households"], 105000)
+        self.assertEqual(self.ladder["units_with_cash_rent"], 102000)
+        self.assertEqual((self.ladder["no_cash_rent_units"], self.ladder["no_cash_rent_units_moe"]), (3000, 200))
+
+    def test_missing(self):
+        self.assertIsNone(hp.rent_ladder({}, COUNTY))
+        acs = county_acs()
+        del acs["b25118"]
+        self.assertIsNone(hp.rent_ladder(acs, COUNTY))
+        acs = county_acs()
+        acs["b25063"][COUNTY][hp.acs_column("b25063", 5)] = None
+        ladder = hp.rent_ladder(acs, COUNTY)
+        lt20k = ladder["rungs"][0]
+        self.assertIsNone(lt20k["units"])
+        self.assertIsNone(lt20k["gap"])
+        self.assertIsNone(lt20k["units_per_100"])
+        self.assertEqual(lt20k["renter_households"], 22000)
+
+    def test_markdown(self):
+        p = hp.build_profile(COUNTY, "El Paso County, Colorado", county_acs(), permits(), 2024)
+        md = hp.render_markdown(p)
+        self.assertIn("## Rents renters can afford (ACS)", md)
+        self.assertIn("| Under $20,000 a year | 22,000 +/- 600 | Under $500 a month | 9,000 +/- 600 | 41 | "
+                      "-13,000 |", md)
+        self.assertIn("| Under $100,000 a year | 90,000 +/- 900 | Under $2,500 a month | 96,000 +/- 917 | 107 | "
+                      "+6,000 |", md)
+        self.assertIn("3,000 renter-occupied units pay no cash rent", md)
+        self.assertLess(md.index("## Rents renters can afford"), md.index("## Cost burden by household income"))
+        empty = hp.build_profile(PLACE, "X city, Colorado", {}, {}, 2024)
+        self.assertIn("No ACS gross rent or renter income record for this geography.", hp.render_markdown(empty))
+
+
 class ProfileTests(unittest.TestCase):
     def setUp(self):
         self.profile = hp.build_profile(COUNTY, "El Paso County, Colorado", county_acs(), permits(), 2024)
@@ -392,6 +489,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(p["acs"], "2020-2024 ACS 5-year estimates")
         self.assertEqual(list(p["metrics"]), hp.METRIC_KEYS)
         self.assertIsNone(p["chas"])
+        self.assertIsNotNone(p["rent_ladder"])
         self.assertTrue(all(v["bound"] is None for v in p["metrics"].values()))
 
     def test_occupancy_and_vacancy(self):
@@ -498,6 +596,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(p["level"], "place")
         self.assertTrue(all(v["value"] is None for v in p["metrics"].values()))
         self.assertIsNone(p["permits"])
+        self.assertIsNone(p["rent_ladder"])
         md = hp.render_markdown(p, {"permit_span": "2024-2025"})
         self.assertIn("n/a", md)
         self.assertIn("No Building Permits Survey record for this geography", md)
@@ -525,6 +624,10 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(hp.fmt(2000000, "usd", "at_least"), "$2,000,000+")
         self.assertEqual(hp.fmt(10000, "usd", "at_most"), "under $10,000")
         self.assertEqual(hp.fmt(None, "usd", "at_least"), "n/a")
+        self.assertEqual(hp.fmt(-13000, "count"), "-13,000")
+        self.assertEqual(hp.fmt_moe(22000, 600, "count"), "22,000 +/- 600")
+        self.assertEqual(hp.fmt_moe(22000, None, "count"), "22,000")
+        self.assertEqual(hp.fmt_moe(None, 600, "count"), "n/a")
         self.assertEqual(hp.slugify("Doña Ana County, New Mexico"), "dona-ana-county")
         self.assertEqual(hp.slugify("Colorado Springs city, Colorado"), "colorado-springs-city")
 
@@ -571,6 +674,21 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(got["chas_le30_severely_cost_burdened"], 5665)
         self.assertEqual(len([c for c in header if c.startswith("chas_")]),
                          len(hp.CHAS_CSV_GROUPS) * len(hp.CHAS_CSV_FIELDS))
+        self.assertEqual(got["rent_ladder_lt20k_units"], "")
+
+    def test_csv_rent_ladder_columns(self):
+        p = hp.build_profile(COUNTY, "El Paso County, Colorado", county_acs(), permits(), 2024)
+        header, values = hp.csv_header(), hp.csv_row(p)
+        got = dict(zip(header, values))
+        self.assertEqual(len([c for c in header if c.startswith("rent_ladder_")]),
+                         len(hp.RENT_LADDER) * len(hp.RENT_LADDER_CSV_FIELDS))
+        self.assertEqual(got["rent_ladder_lt20k_renter_households"], 22000)
+        self.assertEqual(got["rent_ladder_lt20k_units"], 9000)
+        self.assertAlmostEqual(got["rent_ladder_lt20k_units_per_100"], 40.9)
+        self.assertEqual(got["rent_ladder_lt50k_gap"], -20000)
+        self.assertEqual(got["rent_ladder_lt100k_gap"], 6000)
+        # Existing columns keep their places; the new ones come last.
+        self.assertEqual(header[-1], "rent_ladder_lt100k_gap")
 
     def test_write_outputs(self):
         acs = county_acs()
@@ -595,6 +713,7 @@ class OutputTests(unittest.TestCase):
                 data = json.load(fh)
             self.assertEqual(data["metrics"]["median_gross_rent"]["value"], 1755)
             self.assertIsNone(data["metrics"]["median_gross_rent"]["bound"])
+            self.assertEqual(data["rent_ladder"]["rungs"][0]["gap"], -13000)
             with open(os.path.join(tmp, "CO", "README.md"), encoding="utf-8") as fh:
                 index = fh.read()
             self.assertIn("[El Paso County](counties/08041-el-paso-county.md)", index)

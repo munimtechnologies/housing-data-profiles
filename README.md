@@ -19,6 +19,9 @@ Each profile covers the numbers a housing needs assessment usually starts with:
 - **Affordability:** the income needed to rent at the median without cost burden, renter
   income against that need, value-to-income ratio, and the share of renters and owners who
   are cost-burdened (30%+) or severely cost-burdened (50%+)
+- **Rents renters can afford:** renter households earning under $20,000, $50,000 and
+  $100,000 a year against the rented units whose gross rent is under 30% of that income
+  ($500, $1,250 and $2,500 a month): units per 100 households and the gap between them
 - **Cost burden by income:** from HUD's CHAS data, how many households in each income band
   (0-30%, 30-50%, 50-80%, 80-100% and over 100% of HUD Area Median Family Income) pay more
   than 30% or more than 50% of income for housing, with renters shown separately and a total
@@ -41,8 +44,8 @@ python housing_profile.py --states UT,ID --detail-states UT --places-min-pop 250
 python -m unittest -v
 ```
 
-The first run downloads the national ACS table files (about 500 MB) into `.cache/`. After
-that, any state runs in seconds.
+The first run downloads the national ACS table files (several hundred MB) into `.cache/`.
+After that, any state runs in seconds.
 
 **HUD CHAS zips need one manual step.** As of October 2026, HUD's site sends scripts a web
 page instead of the CHAS zip files, so the run carries on without CHAS and its log names the
@@ -65,8 +68,9 @@ and Place. HUD's file names already match, so just put them in `.cache/`:
 Output (in `--out`):
 
 - `states.csv` and `counties.csv`: one row per state and county, with every metric and its
-  margin of error, a `<metric>_bound` column for medians and the ratios built from them, and
-  the CHAS columns (`chas_<band>_<field>`, bands `le30`, `30_50`, `50_80`, `le80` and `all`)
+  margin of error, a `<metric>_bound` column for medians and the ratios built from them, the
+  CHAS columns (`chas_<band>_<field>`, bands `le30`, `30_50`, `50_80`, `le80` and `all`) and,
+  last, the rent table (`rent_ladder_<lt20k|lt50k|lt100k>_<renter_households|units|units_per_100|gap>`)
 - `<ST>/` for each detail state: a Markdown and JSON profile for the state, each county and
   each place above the population cutoff, plus `counties.csv`, `places.csv` and an index
   `README.md`
@@ -95,7 +99,7 @@ reports will have no CHAS section.
 
 | Data | File | Notes |
 |---|---|---|
-| American Community Survey 5-year, tables B01003, B19013, B25001-B25004, B25024, B25034, B25064, B25070, B25077, B25091, B25119 | `www2.census.gov/programs-surveys/acs/summary_file/<year>/table-based-SF/data/5YRData/` | Table-based summary files; no key needed |
+| American Community Survey 5-year, tables B01003, B19013, B25001-B25004, B25024, B25034, B25063, B25064, B25070, B25077, B25091, B25118, B25119 | `www2.census.gov/programs-surveys/acs/summary_file/<year>/table-based-SF/data/5YRData/` | Table-based summary files; no key needed |
 | ACS geography names | `.../table-based-SF/documentation/Geos<year>5YR.txt` | |
 | Building Permits Survey, annual county estimates | `www2.census.gov/econ/bps/County/co<year>a.txt` | Units by structure type (1, 2, 3-4, 5+) |
 | Building Permits Survey, annual place estimates | `www2.census.gov/econ/bps/Place/<Region> Region/<ne,mw,so,we><year>a.txt` | One file per Census region; matched to ACS places by FIPS place code |
@@ -106,6 +110,19 @@ reports will have no CHAS section.
 - **Cost-burdened (ACS):** paying 30% or more of household income on gross rent (renters,
   B25070) or on selected monthly owner costs (owners, B25091). **Severely:** 50% or more.
   Households whose ratio cannot be computed are left out of the denominator.
+- **Rents renters can afford (ACS):** renter households with income under $20,000, $50,000
+  and $100,000 (B25118, renter lines 15-18, 15-21 and 15-23) against renter-occupied units
+  with gross rent under $500, $1,250 and $2,500 (B25063, lines 3-11, 3-20 and 3-23). Each
+  rent is 30% of the income over 12 months, and each income and rent is a bracket edge in the
+  Census tables, so no bracket is split. The line numbers were checked against the Census
+  Bureau's published variable list for the 2024 tables, and the tests check them. "Units per
+  100 households" is units / households x 100; the gap is units minus households, so a
+  negative gap is a shortfall. This counts units by rent, not whether they are open to
+  lower-income renters: some are rented by higher-income households, so the count is an upper
+  limit. Units with no cash rent (B25063 line 27) are reported separately and not counted;
+  their households are. Vacant units for rent are not counted. Incomes are for the past 12
+  months, in ACS-adjusted dollars, and rents are current. HUD's CHAS data measure the same gap
+  against HUD Area Median Family Income.
 - **Cost-burdened (CHAS):** HUD's definition, housing costs over 30% (severely, over 50%) of
   income. As in HUD's own CHAS summaries, the share's denominator is every household in the
   income band, including those whose cost burden is not computed. CHAS covers an earlier ACS
@@ -145,6 +162,11 @@ reports will have no CHAS section.
 
 ## Changes
 
+- **0.4.0:** a "Rents renters can afford" table in every profile: renter households under
+  $20,000, $50,000 and $100,000 a year against renter-occupied units renting under $500,
+  $1,250 and $2,500 a month (ACS B25118 and B25063), with margins of error, units per 100
+  households and the gap, in the Markdown, JSON and CSV outputs (new CSV columns come last,
+  so existing columns keep their places).
 - **0.3.1:** medians in the ACS's open-ended top or bottom interval are shown as bounds
   ("$2,000,000+") instead of the raw code ("$2,000,001"), with `bound` in the JSON, new
   `<metric>_bound` CSV columns, and bounds carried into the ratios built from them; a CHAS
@@ -163,7 +185,7 @@ reports will have no CHAS section.
 
 Made by MV2 of Munim, Inc., with AI agents. The code is tested on fixtures that mirror the
 real Census and HUD file layouts, and it was run end to end on live Census and HUD files for
-Colorado on 2026-10-14 (285 profiles). Issues and corrections are welcome. Apache-2.0 license.
+Colorado on 2026-10-14 (285 profiles). Issues and corrections are welcome. MIT license.
 
 This product uses Census Bureau data but is not endorsed or certified by the Census Bureau.
 It also uses HUD CHAS data and is not endorsed by HUD.
