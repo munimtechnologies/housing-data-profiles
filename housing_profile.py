@@ -15,7 +15,7 @@ Sources:
 Every metric carries its source table and formula, and ACS margins of error are kept
 (and propagated for derived shares, using the Census Bureau's approximation formulas).
 
-By MV2 of Munim, Inc. Made with AI agents. MIT license.
+By MV2 of Munim, Inc. Made with AI agents. Apache-2.0 license.
 This product uses Census Bureau data but is not endorsed or certified by the Census Bureau.
 It also uses HUD CHAS data and is not endorsed by HUD.
 """

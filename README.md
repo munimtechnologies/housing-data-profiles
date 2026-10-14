@@ -163,7 +163,7 @@ reports will have no CHAS section.
 
 Made by MV2 of Munim, Inc., with AI agents. The code is tested on fixtures that mirror the
 real Census and HUD file layouts, and it was run end to end on live Census and HUD files for
-Colorado on 2026-10-14 (285 profiles). Issues and corrections are welcome. MIT license.
+Colorado on 2026-10-14 (285 profiles). Issues and corrections are welcome. Apache-2.0 license.
 
 This product uses Census Bureau data but is not endorsed or certified by the Census Bureau.
 It also uses HUD CHAS data and is not endorsed by HUD.
