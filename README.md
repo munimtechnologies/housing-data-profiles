@@ -160,6 +160,13 @@ reports will have no CHAS section.
   and are skipped.
 - These are informational data profiles. They are not legal, compliance or investment advice.
 
+## Related research
+
+[housing-supply-constraints](https://github.com/munimtechnologies/housing-supply-constraints)
+is a pre-registered, county-level test of whether housing supply constraints explain where
+house prices and housing quantity grew. It uses the same public Census permit files plus FHFA,
+BEA and Baum-Snow and Han (2024) data.
+
 ## Changes
 
 - **0.4.0:** a "Rents renters can afford" table in every profile: renter households under
@@ -185,7 +192,11 @@ reports will have no CHAS section.
 
 Made by MV2 of Munim, Inc., with AI agents. The code is tested on fixtures that mirror the
 real Census and HUD file layouts, and it was run end to end on live Census and HUD files for
-Colorado on 2026-10-14 (285 profiles). Issues and corrections are welcome. MIT license.
+Colorado on 2026-10-14 (285 profiles). Issues and corrections are welcome.
+
+License: Apache-2.0 (see [LICENSE](LICENSE)). Earlier text in this README and in the
+`housing_profile.py` header said MIT; the project is Apache-2.0, and the code header will be
+corrected in the next code release.
 
 This product uses Census Bureau data but is not endorsed or certified by the Census Bureau.
 It also uses HUD CHAS data and is not endorsed by HUD.
