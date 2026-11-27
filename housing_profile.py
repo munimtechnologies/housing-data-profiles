@@ -15,7 +15,8 @@ Sources:
 Every metric carries its source table and formula, and ACS margins of error are kept
 (and propagated for derived shares, using the Census Bureau's approximation formulas).
 
-By MV2 of Munim, Inc. Made with AI agents. MIT license.
+By MV2 of Munim, Inc. Made with AI agents. Licensed under the Apache License 2.0 (Apache-2.0);
+see LICENSE.
 This product uses Census Bureau data but is not endorsed or certified by the Census Bureau.
 It also uses HUD CHAS data and is not endorsed by HUD.
 """
@@ -35,9 +36,9 @@ import urllib.error
 import urllib.request
 import zipfile
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
-REPO_URL = "https://github.com/munimv2/housing-data-profiles"
+REPO_URL = "https://github.com/munimtechnologies/housing-data-profiles"
 USER_AGENT = "housing-data-profiles/%s (MV2 of Munim, Inc.; %s)" % (__version__, REPO_URL)
 
 ACS_BASE = "https://www2.census.gov/programs-surveys/acs/summary_file/{year}/table-based-SF/"
